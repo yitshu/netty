@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -38,7 +38,7 @@ public final class MqttMessageFactory {
             case SUBSCRIBE:
                 return new MqttSubscribeMessage(
                         mqttFixedHeader,
-                        (MqttMessageIdAndPropertiesVariableHeader) variableHeader,
+                        (MqttMessageIdVariableHeader) variableHeader,
                         (MqttSubscribePayload) payload);
 
             case SUBACK:
@@ -56,7 +56,7 @@ public final class MqttMessageFactory {
             case UNSUBSCRIBE:
                 return new MqttUnsubscribeMessage(
                         mqttFixedHeader,
-                        (MqttMessageIdAndPropertiesVariableHeader) variableHeader,
+                        (MqttMessageIdVariableHeader) variableHeader,
                         (MqttUnsubscribePayload) payload);
 
             case PUBLISH:
@@ -82,7 +82,7 @@ public final class MqttMessageFactory {
             case AUTH:
                 //Having MqttReasonCodeAndPropertiesVariableHeader
                 return new MqttMessage(mqttFixedHeader,
-                        (MqttReasonCodeAndPropertiesVariableHeader) variableHeader);
+                        variableHeader);
 
             default:
                 throw new IllegalArgumentException("unknown message type: " + mqttFixedHeader.messageType());

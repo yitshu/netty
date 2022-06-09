@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -20,9 +20,9 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.SupportedCipherSuiteFilter;
-import org.junit.Assert;
-import org.junit.Assume;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.Test;
 
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
@@ -31,7 +31,7 @@ public class Http2SecurityUtilTest {
 
     @Test
     public void testTLSv13CiphersIncluded() throws SSLException {
-        Assume.assumeTrue(SslProvider.isTlsv13Supported(SslProvider.JDK));
+        Assumptions.assumeTrue(SslProvider.isTlsv13Supported(SslProvider.JDK));
         testCiphersIncluded("TLSv1.3");
     }
 
@@ -44,6 +44,6 @@ public class Http2SecurityUtilTest {
         SslContext context = SslContextBuilder.forClient().sslProvider(SslProvider.JDK).protocols(protocol)
                 .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE).build();
         SSLEngine engine = context.newEngine(UnpooledByteBufAllocator.DEFAULT);
-        Assert.assertTrue("No " + protocol + " ciphers found", engine.getEnabledCipherSuites().length > 0);
+        Assertions.assertTrue(engine.getEnabledCipherSuites().length > 0, "No " + protocol + " ciphers found");
     }
 }

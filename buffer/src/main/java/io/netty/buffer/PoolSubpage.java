@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -25,6 +25,7 @@ import static io.netty.buffer.SizeClasses.LOG2_QUANTUM;
 final class PoolSubpage<T> implements PoolSubpageMetric {
 
     final PoolChunk<T> chunk;
+    final int elemSize;
     private final int pageShifts;
     private final int runOffset;
     private final int runSize;
@@ -34,7 +35,6 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
     PoolSubpage<T> next;
 
     boolean doNotDestroy;
-    int elemSize;
     private int maxNumElems;
     private int bitmapLength;
     private int nextAvail;
@@ -60,10 +60,7 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
         this.runSize = runSize;
         this.elemSize = elemSize;
         bitmap = new long[runSize >>> 6 + LOG2_QUANTUM]; // runSize / 64 / QUANTUM
-        init(head, elemSize);
-    }
 
-    void init(PoolSubpage<T> head, int elemSize) {
         doNotDestroy = true;
         if (elemSize != 0) {
             maxNumElems = numAvail = runSize / elemSize;
@@ -118,7 +115,13 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
 
         if (numAvail ++ == 0) {
             addToPool(head);
-            return true;
+            /* When maxNumElems == 1, the maximum numAvail is also 1.
+             * Each of these PoolSubpages will go in here when they do free operation.
+             * If they return true directly from here, then the rest of the code will be unreachable
+             * and they will not actually be recycled. So return true only on maxNumElems > 1. */
+            if (maxNumElems > 1) {
+                return true;
+            }
         }
 
         if (numAvail != maxNumElems) {

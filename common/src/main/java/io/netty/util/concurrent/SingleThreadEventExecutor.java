@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -22,6 +22,7 @@ import io.netty.util.internal.ThreadExecutorMap;
 import io.netty.util.internal.UnstableApi;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
+import org.jetbrains.annotations.Async.Schedule;
 
 import java.lang.Thread.State;
 import java.util.ArrayList;
@@ -329,9 +330,6 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 
     /**
      * Return the number of tasks that are pending for processing.
-     *
-     * <strong>Be aware that this operation may be expensive as it depends on the internal implementation of the
-     * SingleThreadEventExecutor. So use it with care!</strong>
      */
     public int pendingTasks() {
         return taskQueue.size();
@@ -513,7 +511,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
     }
 
     /**
-     * Returns the absolute point in time (relative to {@link #nanoTime()}) at which the the next
+     * Returns the absolute point in time (relative to {@link #nanoTime()}) at which the next
      * closest scheduled task should run.
      */
     @UnstableApi
@@ -601,7 +599,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
             shutdownHooks.clear();
             for (Runnable task: copy) {
                 try {
-                    task.run();
+                    runTask(task);
                 } catch (Throwable t) {
                     logger.warn("Shutdown hook raised an exception.", t);
                 } finally {
@@ -814,12 +812,20 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 
     @Override
     public void execute(Runnable task) {
-        ObjectUtil.checkNotNull(task, "task");
-        execute(task, !(task instanceof LazyRunnable) && wakesUpForTask(task));
+        execute0(task);
     }
 
     @Override
     public void lazyExecute(Runnable task) {
+        lazyExecute0(task);
+    }
+
+    private void execute0(@Schedule Runnable task) {
+        ObjectUtil.checkNotNull(task, "task");
+        execute(task, !(task instanceof LazyRunnable) && wakesUpForTask(task));
+    }
+
+    private void lazyExecute0(@Schedule Runnable task) {
         execute(ObjectUtil.checkNotNull(task, "task"), false);
     }
 

@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -69,33 +69,54 @@ public class JdkSslContext extends SslContext {
     private static final Provider DEFAULT_PROVIDER;
 
     static {
-        SSLContext context;
-        try {
-            context = SSLContext.getInstance(PROTOCOL);
-            context.init(null, null, null);
-        } catch (Exception e) {
-            throw new Error("failed to initialize the default SSL context", e);
-        }
+        Defaults defaults = new Defaults();
+        defaults.init();
 
-        DEFAULT_PROVIDER = context.getProvider();
-
-        SSLEngine engine = context.createSSLEngine();
-        DEFAULT_PROTOCOLS = defaultProtocols(context, engine);
-
-        SUPPORTED_CIPHERS = Collections.unmodifiableSet(supportedCiphers(engine));
-        DEFAULT_CIPHERS = Collections.unmodifiableList(defaultCiphers(engine, SUPPORTED_CIPHERS));
-
-        List<String> ciphersNonTLSv13 = new ArrayList<String>(DEFAULT_CIPHERS);
-        ciphersNonTLSv13.removeAll(Arrays.asList(SslUtils.DEFAULT_TLSV13_CIPHER_SUITES));
-        DEFAULT_CIPHERS_NON_TLSV13 = Collections.unmodifiableList(ciphersNonTLSv13);
-
-        Set<String> suppertedCiphersNonTLSv13 = new LinkedHashSet<String>(SUPPORTED_CIPHERS);
-        suppertedCiphersNonTLSv13.removeAll(Arrays.asList(SslUtils.DEFAULT_TLSV13_CIPHER_SUITES));
-        SUPPORTED_CIPHERS_NON_TLSV13 = Collections.unmodifiableSet(suppertedCiphersNonTLSv13);
+        DEFAULT_PROVIDER = defaults.defaultProvider;
+        DEFAULT_PROTOCOLS = defaults.defaultProtocols;
+        SUPPORTED_CIPHERS = defaults.supportedCiphers;
+        DEFAULT_CIPHERS = defaults.defaultCiphers;
+        DEFAULT_CIPHERS_NON_TLSV13 = defaults.defaultCiphersNonTLSv13;
+        SUPPORTED_CIPHERS_NON_TLSV13 = defaults.supportedCiphersNonTLSv13;
 
         if (logger.isDebugEnabled()) {
             logger.debug("Default protocols (JDK): {} ", Arrays.asList(DEFAULT_PROTOCOLS));
             logger.debug("Default cipher suites (JDK): {}", DEFAULT_CIPHERS);
+        }
+    }
+
+    private static final class Defaults {
+        String[] defaultProtocols;
+        List<String> defaultCiphers;
+        List<String> defaultCiphersNonTLSv13;
+        Set<String> supportedCiphers;
+        Set<String> supportedCiphersNonTLSv13;
+        Provider defaultProvider;
+
+        void init() {
+            SSLContext context;
+            try {
+                context = SSLContext.getInstance(PROTOCOL);
+                context.init(null, null, null);
+            } catch (Exception e) {
+                throw new Error("failed to initialize the default SSL context", e);
+            }
+
+            defaultProvider = context.getProvider();
+
+            SSLEngine engine = context.createSSLEngine();
+            defaultProtocols = defaultProtocols(context, engine);
+
+            supportedCiphers = Collections.unmodifiableSet(supportedCiphers(engine));
+            defaultCiphers = Collections.unmodifiableList(defaultCiphers(engine, supportedCiphers));
+
+            List<String> ciphersNonTLSv13 = new ArrayList<String>(defaultCiphers);
+            ciphersNonTLSv13.removeAll(Arrays.asList(SslUtils.DEFAULT_TLSV13_CIPHER_SUITES));
+            defaultCiphersNonTLSv13 = Collections.unmodifiableList(ciphersNonTLSv13);
+
+            Set<String> suppertedCiphersNonTLSv13 = new LinkedHashSet<String>(supportedCiphers);
+            suppertedCiphersNonTLSv13.removeAll(Arrays.asList(SslUtils.DEFAULT_TLSV13_CIPHER_SUITES));
+            supportedCiphersNonTLSv13 = Collections.unmodifiableSet(suppertedCiphersNonTLSv13);
         }
     }
 
@@ -107,8 +128,8 @@ public class JdkSslContext extends SslContext {
         List<String> protocols = new ArrayList<String>();
         addIfSupported(
                 supportedProtocolsSet, protocols,
-                SslUtils.PROTOCOL_TLS_V1_3, SslUtils.PROTOCOL_TLS_V1_2,
-                SslUtils.PROTOCOL_TLS_V1_1, SslUtils.PROTOCOL_TLS_V1);
+                SslProtocols.TLS_v1_3, SslProtocols.TLS_v1_2,
+                SslProtocols.TLS_v1_1, SslProtocols.TLS_v1);
 
         if (!protocols.isEmpty()) {
             return protocols.toArray(EmptyArrays.EMPTY_STRINGS);
@@ -127,7 +148,7 @@ public class JdkSslContext extends SslContext {
             // prefix instead of the "TLS_" prefix (as defined in the JSSE cipher suite names [1]). According to IBM's
             // documentation [2] the "SSL_" prefix is "interchangeable" with the "TLS_" prefix.
             // See the IBM forum discussion [3] and issue on IBM's JVM [4] for more details.
-            //[1] http://docs.oracle.com/javase/8/docs/technotes/guides/security/StandardNames.html#ciphersuites
+            //[1] https://docs.oracle.com/javase/8/docs/technotes/guides/security/StandardNames.html#ciphersuites
             //[2] https://www.ibm.com/support/knowledgecenter/en/SSYKE2_8.0.0/com.ibm.java.security.component.80.doc/
             // security-component/jsse2Docs/ciphersuites.html
             //[3] https://www.ibm.com/developerworks/community/forums/html/topic?id=9b5a56a9-fa46-4031-b33b-df91e28d77c2
@@ -154,7 +175,7 @@ public class JdkSslContext extends SslContext {
 
     private static boolean isTlsV13Supported(String[] protocols) {
         for (String protocol: protocols) {
-            if (SslUtils.PROTOCOL_TLS_V1_3.equals(protocol)) {
+            if (SslProtocols.TLS_v1_3.equals(protocol)) {
                 return true;
             }
         }
@@ -314,16 +335,6 @@ public class JdkSslContext extends SslContext {
     @Override
     public final List<String> cipherSuites() {
         return unmodifiableCipherSuites;
-    }
-
-    @Override
-    public final long sessionCacheSize() {
-        return sessionContext().getSessionCacheSize();
-    }
-
-    @Override
-    public final long sessionTimeout() {
-        return sessionContext().getSessionTimeout();
     }
 
     @Override

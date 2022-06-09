@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -18,7 +18,7 @@ package io.netty.handler.codec.http.multipart;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.util.internal.PlatformDependent;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -27,8 +27,8 @@ import java.util.Arrays;
 import java.util.UUID;
 
 import static io.netty.util.CharsetUtil.UTF_8;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 /**
  * {@link AbstractDiskHttpData} test cases
@@ -39,7 +39,7 @@ public class AbstractDiskHttpDataTest {
     public void testGetChunk() throws Exception {
         TestHttpData test = new TestHttpData("test", UTF_8, 0);
         try {
-            File tmpFile = File.createTempFile(UUID.randomUUID().toString(), ".tmp");
+            File tmpFile = PlatformDependent.createTempFile(UUID.randomUUID().toString(), ".tmp", null);
             tmpFile.deleteOnExit();
             FileOutputStream fos = new FileOutputStream(tmpFile);
             byte[] bytes = new byte[4096];
@@ -57,8 +57,8 @@ public class AbstractDiskHttpDataTest {
             ByteBuf buf2 = test.getChunk(1024);
             assertEquals(buf2.readerIndex(), 0);
             assertEquals(buf2.writerIndex(), 1024);
-            assertFalse("Arrays should not be equal",
-                    Arrays.equals(ByteBufUtil.getBytes(buf1), ByteBufUtil.getBytes(buf2)));
+            assertFalse(Arrays.equals(ByteBufUtil.getBytes(buf1), ByteBufUtil.getBytes(buf2)),
+                    "Arrays should not be equal");
         } finally {
             test.delete();
         }

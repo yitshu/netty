@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -546,7 +546,7 @@ public class EmbeddedChannel extends AbstractChannel {
         runPendingTasks();
         if (cancel) {
             // Cancel all scheduled tasks that are left.
-            loop.cancelScheduledTasks();
+            embeddedEventLoop().cancelScheduledTasks();
         }
     }
 
@@ -593,13 +593,13 @@ public class EmbeddedChannel extends AbstractChannel {
      */
     public void runPendingTasks() {
         try {
-            loop.runTasks();
+            embeddedEventLoop().runTasks();
         } catch (Exception e) {
             recordException(e);
         }
 
         try {
-            loop.runScheduledTasks();
+            embeddedEventLoop().runScheduledTasks();
         } catch (Exception e) {
             recordException(e);
         }
@@ -612,10 +612,10 @@ public class EmbeddedChannel extends AbstractChannel {
      */
     public long runScheduledPendingTasks() {
         try {
-            return loop.runScheduledTasks();
+            return embeddedEventLoop().runScheduledTasks();
         } catch (Exception e) {
             recordException(e);
-            return loop.nextScheduledTask();
+            return embeddedEventLoop().nextScheduledTask();
         }
     }
 
@@ -673,6 +673,14 @@ public class EmbeddedChannel extends AbstractChannel {
       }
 
       return true;
+    }
+
+    private EmbeddedEventLoop embeddedEventLoop() {
+        if (isRegistered()) {
+            return (EmbeddedEventLoop) super.eventLoop();
+        }
+
+        return loop;
     }
 
     /**

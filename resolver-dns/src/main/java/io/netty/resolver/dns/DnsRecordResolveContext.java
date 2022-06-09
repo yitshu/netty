@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -83,5 +83,11 @@ final class DnsRecordResolveContext extends DnsResolveContext<DnsRecord> {
     void cache(String hostname, DnsRecord[] additionals, UnknownHostException cause) {
         // Do not cache.
         // XXX: When we implement cache, we would need to retain the reference count of the result record.
+    }
+
+    @Override
+    DnsCnameCache cnameCache() {
+        // We don't use a cache here at all as we also don't cache if we end up using the DnsRecordResolverContext.
+        return NoopDnsCnameCache.INSTANCE;
     }
 }

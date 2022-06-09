@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -86,6 +86,18 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         this.id = id;
         unsafe = newUnsafe();
         pipeline = newChannelPipeline();
+    }
+
+    protected final int maxMessagesPerWrite() {
+        ChannelConfig config = config();
+        if (config instanceof DefaultChannelConfig) {
+            return ((DefaultChannelConfig) config).getMaxMessagesPerWrite();
+        }
+        Integer value = config.getOption(ChannelOption.MAX_MESSAGES_PER_WRITE);
+        if (value == null) {
+            return Integer.MAX_VALUE;
+        }
+        return value;
     }
 
     @Override
@@ -600,7 +612,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         }
 
         @Override
-        public final void close(final ChannelPromise promise) {
+        public void close(final ChannelPromise promise) {
             assertEventLoop();
 
             ClosedChannelException closedChannelException =
@@ -638,38 +650,20 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             final Throwable shutdownCause = cause == null ?
                     new ChannelOutputShutdownException("Channel output shutdown") :
                     new ChannelOutputShutdownException("Channel output shutdown", cause);
-            Executor closeExecutor = prepareToClose();
-            if (closeExecutor != null) {
-                closeExecutor.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            // Execute the shutdown.
-                            doShutdownOutput();
-                            promise.setSuccess();
-                        } catch (Throwable err) {
-                            promise.setFailure(err);
-                        } finally {
-                            // Dispatch to the EventLoop
-                            eventLoop().execute(new Runnable() {
-                                @Override
-                                public void run() {
-                                    closeOutboundBufferForShutdown(pipeline, outboundBuffer, shutdownCause);
-                                }
-                            });
-                        }
-                    }
-                });
-            } else {
-                try {
-                    // Execute the shutdown.
-                    doShutdownOutput();
-                    promise.setSuccess();
-                } catch (Throwable err) {
-                    promise.setFailure(err);
-                } finally {
-                    closeOutboundBufferForShutdown(pipeline, outboundBuffer, shutdownCause);
-                }
+
+            // When a side enables SO_LINGER and calls showdownOutput(...) to start TCP half-closure
+            // we can not call doDeregister here because we should ensure this side in fin_wait2 state
+            // can still receive and process the data which is send by another side in the close_wait state。
+            // See https://github.com/netty/netty/issues/11981
+            try {
+                // The shutdown function does not block regardless of the SO_LINGER setting on the socket
+                // so we don't need to use GlobalEventExecutor to execute the shutdown
+                doShutdownOutput();
+                promise.setSuccess();
+            } catch (Throwable err) {
+                promise.setFailure(err);
+            } finally {
+                closeOutboundBufferForShutdown(pipeline, outboundBuffer, shutdownCause);
             }
         }
 
@@ -836,10 +830,6 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         public final void beginRead() {
             assertEventLoop();
 
-            if (!isActive()) {
-                return;
-            }
-
             try {
                 doBeginRead();
             } catch (final Exception e) {
@@ -859,13 +849,17 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
             ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
             if (outboundBuffer == null) {
-                // If the outboundBuffer is null we know the channel was closed and so
-                // need to fail the future right away. If it is not null the handling of the rest
-                // will be done in flush0()
-                // See https://github.com/netty/netty/issues/2362
-                safeSetFailure(promise, newClosedChannelException(initialCloseCause, "write(Object, ChannelPromise)"));
-                // release message now to prevent resource-leak
-                ReferenceCountUtil.release(msg);
+                try {
+                    // release message now to prevent resource-leak
+                    ReferenceCountUtil.release(msg);
+                } finally {
+                    // If the outboundBuffer is null we know the channel was closed and so
+                    // need to fail the future right away. If it is not null the handling of the rest
+                    // will be done in flush0()
+                    // See https://github.com/netty/netty/issues/2362
+                    safeSetFailure(promise,
+                            newClosedChannelException(initialCloseCause, "write(Object, ChannelPromise)"));
+                }
                 return;
             }
 
@@ -877,8 +871,11 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                     size = 0;
                 }
             } catch (Throwable t) {
-                safeSetFailure(promise, t);
-                ReferenceCountUtil.release(msg);
+                try {
+                    ReferenceCountUtil.release(msg);
+                } finally {
+                    safeSetFailure(promise, t);
+                }
                 return;
             }
 
@@ -933,27 +930,31 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             try {
                 doWrite(outboundBuffer);
             } catch (Throwable t) {
-                if (t instanceof IOException && config().isAutoClose()) {
-                    /**
-                     * Just call {@link #close(ChannelPromise, Throwable, boolean)} here which will take care of
-                     * failing all flushed messages and also ensure the actual close of the underlying transport
-                     * will happen before the promises are notified.
-                     *
-                     * This is needed as otherwise {@link #isActive()} , {@link #isOpen()} and {@link #isWritable()}
-                     * may still return {@code true} even if the channel should be closed as result of the exception.
-                     */
-                    initialCloseCause = t;
-                    close(voidPromise(), t, newClosedChannelException(t, "flush0()"), false);
-                } else {
-                    try {
-                        shutdownOutput(voidPromise(), t);
-                    } catch (Throwable t2) {
-                        initialCloseCause = t;
-                        close(voidPromise(), t2, newClosedChannelException(t, "flush0()"), false);
-                    }
-                }
+                handleWriteError(t);
             } finally {
                 inFlush0 = false;
+            }
+        }
+
+        protected final void handleWriteError(Throwable t) {
+            if (t instanceof IOException && config().isAutoClose()) {
+                /**
+                 * Just call {@link #close(ChannelPromise, Throwable, boolean)} here which will take care of
+                 * failing all flushed messages and also ensure the actual close of the underlying transport
+                 * will happen before the promises are notified.
+                 *
+                 * This is needed as otherwise {@link #isActive()} , {@link #isOpen()} and {@link #isWritable()}
+                 * may still return {@code true} even if the channel should be closed as result of the exception.
+                 */
+                initialCloseCause = t;
+                close(voidPromise(), t, newClosedChannelException(t, "flush0()"), false);
+            } else {
+                try {
+                    shutdownOutput(voidPromise(), t);
+                } catch (Throwable t2) {
+                    initialCloseCause = t;
+                    close(voidPromise(), t2, newClosedChannelException(t, "flush0()"), false);
+                }
             }
         }
 
@@ -1173,8 +1174,9 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             initCause(exception);
         }
 
+        // Suppress a warning since this method doesn't need synchronization
         @Override
-        public Throwable fillInStackTrace() {
+        public Throwable fillInStackTrace() {   // lgtm[java/non-sync-override]
             return this;
         }
     }
@@ -1188,8 +1190,9 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             initCause(exception);
         }
 
+        // Suppress a warning since this method doesn't need synchronization
         @Override
-        public Throwable fillInStackTrace() {
+        public Throwable fillInStackTrace() {   // lgtm[java/non-sync-override]
             return this;
         }
     }
@@ -1203,8 +1206,9 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             initCause(exception);
         }
 
+        // Suppress a warning since this method doesn't need synchronization
         @Override
-        public Throwable fillInStackTrace() {
+        public Throwable fillInStackTrace() {   // lgtm[java/non-sync-override]
             return this;
         }
     }

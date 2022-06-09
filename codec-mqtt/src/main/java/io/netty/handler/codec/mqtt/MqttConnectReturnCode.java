@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -15,10 +15,6 @@
  */
 
 package io.netty.handler.codec.mqtt;
-
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
 
 /**
  * Return Code of {@link MqttConnAckMessage}
@@ -54,14 +50,16 @@ public enum MqttConnectReturnCode {
     CONNECTION_REFUSED_SERVER_MOVED((byte) 0x9D),
     CONNECTION_REFUSED_CONNECTION_RATE_EXCEEDED((byte) 0x9F);
 
-    private static final Map<Byte, MqttConnectReturnCode> VALUE_TO_CODE_MAP;
+    private static final MqttConnectReturnCode[] VALUES;
 
     static {
-        final Map<Byte, MqttConnectReturnCode> valueMap = new HashMap<Byte, MqttConnectReturnCode>();
-        for (MqttConnectReturnCode code: values()) {
-            valueMap.put(code.byteValue, code);
+        MqttConnectReturnCode[] values = values();
+        VALUES = new MqttConnectReturnCode[160];
+        for (MqttConnectReturnCode code : values) {
+            final int unsignedByte = code.byteValue & 0xFF;
+            // Suppress a warning about out of bounds access since the enum contains only correct values
+            VALUES[unsignedByte] = code;    // lgtm [java/index-out-of-bounds]
         }
-        VALUE_TO_CODE_MAP = Collections.unmodifiableMap(valueMap);
     }
 
     private final byte byteValue;
@@ -75,9 +73,16 @@ public enum MqttConnectReturnCode {
     }
 
     public static MqttConnectReturnCode valueOf(byte b) {
-        if (VALUE_TO_CODE_MAP.containsKey(b)) {
-            return VALUE_TO_CODE_MAP.get(b);
+        final int unsignedByte = b & 0xFF;
+        MqttConnectReturnCode mqttConnectReturnCode = null;
+        try {
+            mqttConnectReturnCode = VALUES[unsignedByte];
+        } catch (ArrayIndexOutOfBoundsException ignored) {
+            // no op
         }
-        throw new IllegalArgumentException("unknown connect return code: " + (b & 0xFF));
+        if (mqttConnectReturnCode == null) {
+            throw new IllegalArgumentException("unknown connect return code: " + unsignedByte);
+        }
+        return mqttConnectReturnCode;
     }
 }

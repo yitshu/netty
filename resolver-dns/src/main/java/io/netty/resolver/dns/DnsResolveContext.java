@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -41,12 +41,15 @@ import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.SuppressJava6Requirement;
 import io.netty.util.internal.ThrowableUtil;
+import io.netty.util.internal.logging.InternalLogger;
+import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.util.AbstractList;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
@@ -61,27 +64,23 @@ import static io.netty.resolver.dns.DnsAddressDecoder.decodeAddress;
 import static java.lang.Math.min;
 
 abstract class DnsResolveContext<T> {
+    private static final InternalLogger logger = InternalLoggerFactory.getInstance(DnsResolveContext.class);
 
-    private static final RuntimeException NXDOMAIN_QUERY_FAILED_EXCEPTION = ThrowableUtil.unknownStackTrace(
-            DnsResolveContextException.newStatic("No answer found and NXDOMAIN response code returned"),
-            DnsResolveContext.class,
-            "onResponse(..)");
-    private static final RuntimeException CNAME_NOT_FOUND_QUERY_FAILED_EXCEPTION = ThrowableUtil.unknownStackTrace(
-            DnsResolveContextException.newStatic("No matching CNAME record found"),
-            DnsResolveContext.class,
-            "onResponseCNAME(..)");
-    private static final RuntimeException NO_MATCHING_RECORD_QUERY_FAILED_EXCEPTION = ThrowableUtil.unknownStackTrace(
-            DnsResolveContextException.newStatic("No matching record type found"),
-            DnsResolveContext.class,
-            "onResponseAorAAAA(..)");
-    private static final RuntimeException UNRECOGNIZED_TYPE_QUERY_FAILED_EXCEPTION = ThrowableUtil.unknownStackTrace(
-            new RuntimeException("Response type was unrecognized"),
-            DnsResolveContext.class,
-            "onResponse(..)");
-    private static final RuntimeException NAME_SERVERS_EXHAUSTED_EXCEPTION = ThrowableUtil.unknownStackTrace(
-            DnsResolveContextException.newStatic("No name servers returned an answer"),
-            DnsResolveContext.class,
-            "tryToFinishResolve(..)");
+    private static final RuntimeException NXDOMAIN_QUERY_FAILED_EXCEPTION =
+            DnsResolveContextException.newStatic("No answer found and NXDOMAIN response code returned",
+            DnsResolveContext.class, "onResponse(..)");
+    private static final RuntimeException CNAME_NOT_FOUND_QUERY_FAILED_EXCEPTION =
+            DnsResolveContextException.newStatic("No matching CNAME record found",
+            DnsResolveContext.class, "onResponseCNAME(..)");
+    private static final RuntimeException NO_MATCHING_RECORD_QUERY_FAILED_EXCEPTION =
+            DnsResolveContextException.newStatic("No matching record type found",
+            DnsResolveContext.class, "onResponseAorAAAA(..)");
+    private static final RuntimeException UNRECOGNIZED_TYPE_QUERY_FAILED_EXCEPTION =
+            DnsResolveContextException.newStatic("Response type was unrecognized",
+            DnsResolveContext.class, "onResponse(..)");
+    private static final RuntimeException NAME_SERVERS_EXHAUSTED_EXCEPTION =
+            DnsResolveContextException.newStatic("No name servers returned an answer",
+            DnsResolveContext.class, "tryToFinishResolve(..)");
 
     final DnsNameResolver parent;
     private final Promise<?> originalPromise;
@@ -118,6 +117,8 @@ abstract class DnsResolveContext<T> {
 
     static final class DnsResolveContextException extends RuntimeException {
 
+        private static final long serialVersionUID = 1209303419266433003L;
+
         private DnsResolveContextException(String message) {
             super(message);
         }
@@ -129,11 +130,21 @@ abstract class DnsResolveContext<T> {
             assert shared;
         }
 
-        static DnsResolveContextException newStatic(String message) {
+        // Override fillInStackTrace() so we not populate the backtrace via a native call and so leak the
+        // Classloader.
+        @Override
+        public Throwable fillInStackTrace() {
+            return this;
+        }
+
+        static DnsResolveContextException newStatic(String message, Class<?> clazz, String method) {
+            final DnsResolveContextException exception;
             if (PlatformDependent.javaVersion() >= 7) {
-                return new DnsResolveContextException(message, true);
+                exception = new DnsResolveContextException(message, true);
+            } else {
+                exception = new DnsResolveContextException(message);
             }
-            return new DnsResolveContextException(message);
+            return ThrowableUtil.unknownStackTrace(exception, clazz, method);
         }
     }
 
@@ -222,7 +233,7 @@ abstract class DnsResolveContext<T> {
                         }
                     } else {
                         if (DnsNameResolver.isTransportOrTimeoutError(cause)) {
-                            promise.tryFailure(new SearchDomainUnknownHostException(cause, hostname));
+                            promise.tryFailure(new SearchDomainUnknownHostException(cause, hostname, searchDomains));
                         } else if (searchDomainIdx < searchDomains.length) {
                             Promise<List<T>> newPromise = parent.executor().newPromise();
                             newPromise.addListener(this);
@@ -230,7 +241,7 @@ abstract class DnsResolveContext<T> {
                         } else if (!startWithoutSearchDomain) {
                             internalResolve(hostname, promise);
                         } else {
-                            promise.tryFailure(new SearchDomainUnknownHostException(cause, hostname));
+                            promise.tryFailure(new SearchDomainUnknownHostException(cause, hostname, searchDomains));
                         }
                     }
                 }
@@ -251,16 +262,17 @@ abstract class DnsResolveContext<T> {
     private static final class SearchDomainUnknownHostException extends UnknownHostException {
         private static final long serialVersionUID = -8573510133644997085L;
 
-        SearchDomainUnknownHostException(Throwable cause, String originalHostname) {
-            super("Search domain query failed. Original hostname: '" + originalHostname + "' " + cause.getMessage());
+        SearchDomainUnknownHostException(Throwable cause, String originalHostname, String[] searchDomains) {
+            super("Failed to resolve '" + originalHostname + "' and search domain query for configured domains" +
+                    " failed as well: " + Arrays.toString(searchDomains));
             setStackTrace(cause.getStackTrace());
-
             // Preserve the cause
             initCause(cause.getCause());
         }
 
+        // Suppress a warning since this method doesn't need synchronization
         @Override
-        public Throwable fillInStackTrace() {
+        public Throwable fillInStackTrace() {   // lgtm[java/non-sync-override]
             return this;
         }
     }
@@ -784,12 +796,41 @@ abstract class DnsResolveContext<T> {
                 } while (resolved != null);
 
                 if (resolved == null) {
-                    continue;
+                    assert questionName.isEmpty() || questionName.charAt(questionName.length() - 1) == '.';
+
+                    for (String searchDomain : parent.searchDomains()) {
+                        if (searchDomain.isEmpty()) {
+                            continue;
+                        }
+
+                        final String fqdn;
+                        if (searchDomain.charAt(searchDomain.length() - 1) == '.') {
+                            fqdn = questionName + searchDomain;
+                        } else {
+                            fqdn = questionName + searchDomain + '.';
+                        }
+                        if (recordName.equals(fqdn)) {
+                            resolved = recordName;
+                            break;
+                        }
+                    }
+                    if (resolved == null) {
+                        if (logger.isDebugEnabled()) {
+                            logger.debug("Ignoring record {} as it contains a different name than the " +
+                                            "question name [{}]. Cnames: {}, Search domains: {}",
+                                    r.toString(), questionName, cnames, parent.searchDomains());
+                        }
+                        continue;
+                    }
                 }
             }
 
             final T converted = convertRecord(r, hostname, additionals, parent.executor());
             if (converted == null) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Ignoring record {} as the converted record is null. hostname [{}], Additionals: {}",
+                            r.toString(), hostname, additionals);
+                }
                 continue;
             }
 
@@ -943,7 +984,8 @@ abstract class DnsResolveContext<T> {
             // If cause != null we know this was caused by a timeout / cancel / transport exception. In this case we
             // won't try to resolve the CNAME as we only should do this if we could not get the expected records
             // because they do not exist and the DNS server did probably signal it.
-            if (cause == null && !triedCNAME) {
+            if (cause == null && !triedCNAME &&
+                    (question.type() == DnsRecordType.A || question.type() == DnsRecordType.AAAA)) {
                 // As the last resort, try to query CNAME, just in case the name server has it.
                 triedCNAME = true;
 
@@ -990,7 +1032,7 @@ abstract class DnsResolveContext<T> {
         final int tries = maxAllowedQueries - allowedQueries;
         final StringBuilder buf = new StringBuilder(64);
 
-        buf.append("failed to resolve '").append(hostname).append('\'');
+        buf.append("Failed to resolve '").append(hostname).append('\'');
         if (tries > 1) {
             if (tries < maxAllowedQueries) {
                 buf.append(" after ")

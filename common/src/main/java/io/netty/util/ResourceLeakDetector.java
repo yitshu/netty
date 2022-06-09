@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -31,7 +31,6 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -256,12 +255,12 @@ public class ResourceLeakDetector<T> {
         if (level.ordinal() < Level.PARANOID.ordinal()) {
             if ((PlatformDependent.threadLocalRandom().nextInt(samplingInterval)) == 0) {
                 reportLeak();
-                return new DefaultResourceLeak(obj, refQueue, allLeaks);
+                return new DefaultResourceLeak(obj, refQueue, allLeaks, getInitialHint(resourceType));
             }
             return null;
         }
         reportLeak();
-        return new DefaultResourceLeak(obj, refQueue, allLeaks);
+        return new DefaultResourceLeak(obj, refQueue, allLeaks, getInitialHint(resourceType));
     }
 
     private void clearRefQueue() {
@@ -301,7 +300,7 @@ public class ResourceLeakDetector<T> {
                 continue;
             }
 
-            String records = ref.toString();
+            String records = ref.getReportAndClearRecords();
             if (reportedLeaks.add(records)) {
                 if (records.isEmpty()) {
                     reportUntracedLeak(resourceType);
@@ -343,6 +342,15 @@ public class ResourceLeakDetector<T> {
     protected void reportInstancesLeak(String resourceType) {
     }
 
+    /**
+     * Create a hint object to be attached to an object tracked by this record. Similar to the additional information
+     * supplied to {@link ResourceLeakTracker#record(Object)}, will be printed alongside the stack trace of the
+     * creation of the resource.
+     */
+    protected Object getInitialHint(String resourceType) {
+        return null;
+    }
+
     @SuppressWarnings("deprecation")
     private static final class DefaultResourceLeak<T>
             extends WeakReference<Object> implements ResourceLeakTracker<T>, ResourceLeak {
@@ -368,7 +376,8 @@ public class ResourceLeakDetector<T> {
         DefaultResourceLeak(
                 Object referent,
                 ReferenceQueue<Object> refQueue,
-                Set<DefaultResourceLeak<?>> allLeaks) {
+                Set<DefaultResourceLeak<?>> allLeaks,
+                Object initialHint) {
             super(referent, refQueue);
 
             assert referent != null;
@@ -379,7 +388,8 @@ public class ResourceLeakDetector<T> {
             trackedHash = System.identityHashCode(referent);
             allLeaks.add(this);
             // Create a new Record so we always have the creation stacktrace included.
-            headUpdater.set(this, new TraceRecord(TraceRecord.BOTTOM));
+            headUpdater.set(this, initialHint == null ?
+                    new TraceRecord(TraceRecord.BOTTOM) : new TraceRecord(TraceRecord.BOTTOM, initialHint));
             this.allLeaks = allLeaks;
         }
 
@@ -509,7 +519,16 @@ public class ResourceLeakDetector<T> {
 
         @Override
         public String toString() {
+            TraceRecord oldHead = headUpdater.get(this);
+            return generateReport(oldHead);
+        }
+
+        String getReportAndClearRecords() {
             TraceRecord oldHead = headUpdater.getAndSet(this, null);
+            return generateReport(oldHead);
+        }
+
+        private String generateReport(TraceRecord oldHead) {
             if (oldHead == null) {
                 // Already closed
                 return EMPTY_STRING;
@@ -588,10 +607,20 @@ public class ResourceLeakDetector<T> {
         } while (!excludedMethods.compareAndSet(oldMethods, newMethods));
     }
 
-    private static final class TraceRecord extends Throwable {
+    private static class TraceRecord extends Throwable {
         private static final long serialVersionUID = 6065153674892850720L;
 
-        private static final TraceRecord BOTTOM = new TraceRecord();
+        private static final TraceRecord BOTTOM = new TraceRecord() {
+            private static final long serialVersionUID = 7396077602074694571L;
+
+            // Override fillInStackTrace() so we not populate the backtrace via a native call and so leak the
+            // Classloader.
+            // See https://github.com/netty/netty/pull/10691
+            @Override
+            public Throwable fillInStackTrace() {
+                return this;
+            }
+        };
 
         private final String hintString;
         private final TraceRecord next;
@@ -632,8 +661,10 @@ public class ResourceLeakDetector<T> {
                 // Strip the noisy stack trace elements.
                 String[] exclusions = excludedMethods.get();
                 for (int k = 0; k < exclusions.length; k += 2) {
+                    // Suppress a warning about out of bounds access
+                    // since the length of excludedMethods is always even, see addExclusions()
                     if (exclusions[k].equals(element.getClassName())
-                            && exclusions[k + 1].equals(element.getMethodName())) {
+                            && exclusions[k + 1].equals(element.getMethodName())) { // lgtm[java/index-out-of-bounds]
                         continue out;
                     }
                 }

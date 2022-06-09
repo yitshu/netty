@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -23,12 +23,16 @@ import io.netty.handler.codec.base64.Base64;
 import io.netty.handler.codec.base64.Base64Dialect;
 import io.netty.util.NetUtil;
 import io.netty.util.internal.EmptyArrays;
+import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.ArrayList;
+import java.security.KeyManagementException;
+import java.security.NoSuchAlgorithmException;
+import java.security.NoSuchProviderException;
+import java.security.Provider;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -51,14 +55,11 @@ final class SslUtils {
             asList("TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256",
                           "TLS_AES_128_GCM_SHA256", "TLS_AES_128_CCM_8_SHA256",
                           "TLS_AES_128_CCM_SHA256")));
-    // Protocols
-    static final String PROTOCOL_SSL_V2_HELLO = "SSLv2Hello";
-    static final String PROTOCOL_SSL_V2 = "SSLv2";
-    static final String PROTOCOL_SSL_V3 = "SSLv3";
-    static final String PROTOCOL_TLS_V1 = "TLSv1";
-    static final String PROTOCOL_TLS_V1_1 = "TLSv1.1";
-    static final String PROTOCOL_TLS_V1_2 = "TLSv1.2";
-    static final String PROTOCOL_TLS_V1_3 = "TLSv1.3";
+
+    /**
+     * GMSSL Protocol Version
+     */
+    static final int GMSSL_PROTOCOL_VERSION = 0x101;
 
     static final String INVALID_CIPHER = "SSL_NULL_WITH_NULL_NULL";
 
@@ -110,42 +111,15 @@ final class SslUtils {
     private static final boolean TLSV1_3_JDK_DEFAULT_ENABLED;
 
     static {
-        boolean tlsv13Supported = false;
-        boolean tlsv13Enabled = false;
-
-        Throwable cause = null;
-        try {
-            SSLContext context = SSLContext.getInstance("TLS");
-            context.init(null, new TrustManager[0], null);
-            for (String supported: context.getSupportedSSLParameters().getProtocols()) {
-                if (PROTOCOL_TLS_V1_3.equals(supported)) {
-                    tlsv13Supported = true;
-                    break;
-                }
-            }
-            for (String enabled: context.getDefaultSSLParameters().getProtocols()) {
-                if (PROTOCOL_TLS_V1_3.equals(enabled)) {
-                    tlsv13Enabled = true;
-                    break;
-                }
-            }
-        } catch (Throwable error) {
-            cause = error;
-        }
-        if (cause == null) {
-            logger.debug("JDK SSLEngine supports TLSv1.3: {}", tlsv13Supported);
-        } else {
-            logger.debug("Unable to detect if JDK SSLEngine supports TLSv1.3, assuming no", cause);
-        }
-        TLSV1_3_JDK_SUPPORTED = tlsv13Supported;
-        TLSV1_3_JDK_DEFAULT_ENABLED = tlsv13Enabled;
+        TLSV1_3_JDK_SUPPORTED = isTLSv13SupportedByJDK0(null);
+        TLSV1_3_JDK_DEFAULT_ENABLED = isTLSv13EnabledByJDK0(null);
         if (TLSV1_3_JDK_SUPPORTED) {
             DEFAULT_TLSV13_CIPHER_SUITES = TLSV13_CIPHER_SUITES;
         } else {
             DEFAULT_TLSV13_CIPHER_SUITES = EmptyArrays.EMPTY_STRINGS;
         }
 
-        List<String> defaultCiphers = new ArrayList<String>();
+        Set<String> defaultCiphers = new LinkedHashSet<String>();
         // GCM (Galois/Counter Mode) requires JDK 8.
         defaultCiphers.add("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384");
         defaultCiphers.add("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256");
@@ -168,15 +142,80 @@ final class SslUtils {
     /**
      * Returns {@code true} if the JDK itself supports TLSv1.3, {@code false} otherwise.
      */
-    static boolean isTLSv13SupportedByJDK() {
-        return TLSV1_3_JDK_SUPPORTED;
+    static boolean isTLSv13SupportedByJDK(Provider provider) {
+        if (provider == null) {
+            return TLSV1_3_JDK_SUPPORTED;
+        }
+        return isTLSv13SupportedByJDK0(provider);
+    }
+
+    private static boolean isTLSv13SupportedByJDK0(Provider provider) {
+        try {
+            return arrayContains(newInitContext(provider)
+                    .getSupportedSSLParameters().getProtocols(), SslProtocols.TLS_v1_3);
+        } catch (Throwable cause) {
+            logger.debug("Unable to detect if JDK SSLEngine with provider {} supports TLSv1.3, assuming no",
+                    provider, cause);
+            return false;
+        }
     }
 
     /**
      * Returns {@code true} if the JDK itself supports TLSv1.3 and enabled it by default, {@code false} otherwise.
      */
-    static boolean isTLSv13EnabledByJDK() {
-        return TLSV1_3_JDK_DEFAULT_ENABLED;
+    static boolean isTLSv13EnabledByJDK(Provider provider) {
+        if (provider == null) {
+            return TLSV1_3_JDK_DEFAULT_ENABLED;
+        }
+        return isTLSv13EnabledByJDK0(provider);
+    }
+
+    private static boolean isTLSv13EnabledByJDK0(Provider provider) {
+        try {
+            return arrayContains(newInitContext(provider)
+                    .getDefaultSSLParameters().getProtocols(), SslProtocols.TLS_v1_3);
+        } catch (Throwable cause) {
+            logger.debug("Unable to detect if JDK SSLEngine with provider {} enables TLSv1.3 by default," +
+                    " assuming no", provider, cause);
+            return false;
+        }
+    }
+
+    private static SSLContext newInitContext(Provider provider)
+            throws NoSuchAlgorithmException, KeyManagementException {
+        final SSLContext context;
+        if (provider == null) {
+            context = SSLContext.getInstance("TLS");
+        } else {
+            context = SSLContext.getInstance("TLS", provider);
+        }
+        context.init(null, new TrustManager[0], null);
+        return context;
+    }
+
+    static SSLContext getSSLContext(String provider)
+            throws NoSuchAlgorithmException, KeyManagementException, NoSuchProviderException {
+        final SSLContext context;
+        if (StringUtil.isNullOrEmpty(provider)) {
+            context = SSLContext.getInstance(getTlsVersion());
+        } else {
+            context = SSLContext.getInstance(getTlsVersion(), provider);
+        }
+        context.init(null, new TrustManager[0], null);
+        return context;
+    }
+
+    private static String getTlsVersion() {
+        return TLSV1_3_JDK_SUPPORTED ? SslProtocols.TLS_v1_3 : SslProtocols.TLS_v1_2;
+    }
+
+    static boolean arrayContains(String[] array, String value) {
+        for (String v: array) {
+            if (value.equals(v)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -252,10 +291,10 @@ final class SslUtils {
         }
 
         if (tls) {
-            // SSLv3 or TLS - Check ProtocolVersion
+            // SSLv3 or TLS or GMSSLv1.0 or GMSSLv1.1 - Check ProtocolVersion
             int majorVersion = buffer.getUnsignedByte(offset + 1);
-            if (majorVersion == 3) {
-                // SSLv3 or TLS
+            if (majorVersion == 3 || buffer.getShort(offset + 1) == GMSSL_PROTOCOL_VERSION) {
+                // SSLv3 or TLS or GMSSLv1.0 or GMSSLv1.1
                 packetLength = unsignedShortBE(buffer, offset + 3) + SSL_RECORD_HEADER_LENGTH;
                 if (packetLength <= SSL_RECORD_HEADER_LENGTH) {
                     // Neither SSLv3 or TLSv1 (i.e. SSLv2 or bad data)
@@ -288,15 +327,21 @@ final class SslUtils {
     // Reads a big-endian unsigned short integer from the buffer
     @SuppressWarnings("deprecation")
     private static int unsignedShortBE(ByteBuf buffer, int offset) {
-        return buffer.order() == ByteOrder.BIG_ENDIAN ?
-                buffer.getUnsignedShort(offset) : buffer.getUnsignedShortLE(offset);
+        int value = buffer.getUnsignedShort(offset);
+        if (buffer.order() == ByteOrder.LITTLE_ENDIAN) {
+            value = Integer.reverseBytes(value) >>> Short.SIZE;
+        }
+        return value;
     }
 
     // Reads a big-endian short integer from the buffer
     @SuppressWarnings("deprecation")
     private static short shortBE(ByteBuf buffer, int offset) {
-        return buffer.order() == ByteOrder.BIG_ENDIAN ?
-                buffer.getShort(offset) : buffer.getShortLE(offset);
+        short value = buffer.getShort(offset);
+        if (buffer.order() == ByteOrder.LITTLE_ENDIAN) {
+            value = Short.reverseBytes(value);
+        }
+        return value;
     }
 
     private static short unsignedByte(byte b) {
@@ -357,10 +402,10 @@ final class SslUtils {
         }
 
         if (tls) {
-            // SSLv3 or TLS - Check ProtocolVersion
+            // SSLv3 or TLS or GMSSLv1.0 or GMSSLv1.1 - Check ProtocolVersion
             int majorVersion = unsignedByte(buffer.get(pos + 1));
-            if (majorVersion == 3) {
-                // SSLv3 or TLS
+            if (majorVersion == 3 || buffer.getShort(pos + 1) == GMSSL_PROTOCOL_VERSION) {
+                // SSLv3 or TLS or GMSSLv1.0 or GMSSLv1.1
                 packetLength = unsignedShortBE(buffer, pos + 3) + SSL_RECORD_HEADER_LENGTH;
                 if (packetLength <= SSL_RECORD_HEADER_LENGTH) {
                     // Neither SSLv3 or TLSv1 (i.e. SSLv2 or bad data)
@@ -433,15 +478,18 @@ final class SslUtils {
      * Validate that the given hostname can be used in SNI extension.
      */
     static boolean isValidHostNameForSNI(String hostname) {
+        // See  https://datatracker.ietf.org/doc/html/rfc6066#section-3
         return hostname != null &&
+               // SNI HostName has to be a FQDN according to TLS SNI Extension spec (see [1]),
+               // which means that is has to have at least a host name and a domain part.
                hostname.indexOf('.') > 0 &&
-               !hostname.endsWith(".") &&
+               !hostname.endsWith(".") && !hostname.startsWith("/") &&
                !NetUtil.isValidIpV4Address(hostname) &&
                !NetUtil.isValidIpV6Address(hostname);
     }
 
     /**
-     * Returns {@code true} if the the given cipher (in openssl format) is for TLSv1.3, {@code false} otherwise.
+     * Returns {@code true} if the given cipher (in openssl format) is for TLSv1.3, {@code false} otherwise.
      */
     static boolean isTLSv13Cipher(String cipher) {
         // See https://tools.ietf.org/html/rfc8446#appendix-B.4

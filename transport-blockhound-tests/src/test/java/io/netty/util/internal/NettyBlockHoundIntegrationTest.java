@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
 
- * http://www.apache.org/licenses/LICENSE-2.0
+ * https://www.apache.org/licenses/LICENSE-2.0
 
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -20,11 +20,13 @@ import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.ssl.SslContext;
@@ -34,6 +36,9 @@ import io.netty.handler.ssl.SslHandshakeCompletionEvent;
 import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
+import io.netty.resolver.dns.DnsNameResolverBuilder;
+import io.netty.resolver.dns.DnsServerAddressStreamProviders;
+import io.netty.util.HashedWheelTimer;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.EventExecutor;
@@ -44,29 +49,48 @@ import io.netty.util.concurrent.ScheduledFuture;
 import io.netty.util.concurrent.SingleThreadEventExecutor;
 import io.netty.util.internal.Hidden.NettyBlockHoundIntegration;
 import org.hamcrest.Matchers;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.DisabledIf;
 import reactor.blockhound.BlockHound;
 import reactor.blockhound.BlockingOperationError;
 import reactor.blockhound.integration.BlockHoundIntegration;
 
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Queue;
 import java.util.ServiceLoader;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
-import static org.junit.Assert.assertThat;
-import static org.junit.Assert.fail;
-import static org.junit.Assume.assumeTrue;
+import static io.netty.buffer.Unpooled.wrappedBuffer;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+@DisabledIf("isDisabledIfJavaVersion18OrAbove")
 public class NettyBlockHoundIntegrationTest {
 
-    @BeforeClass
+    private static boolean isDisabledIfJavaVersion18OrAbove() {
+        return PlatformDependent.javaVersion() >= 18;
+    }
+
+    @BeforeAll
     public static void setUpClass() {
         BlockHound.install();
     }
@@ -98,12 +122,14 @@ public class NettyBlockHoundIntegrationTest {
         }
     }
 
-    @Test(timeout = 5000L)
+    @Test
+    @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
     public void testGlobalEventExecutorTakeTask() throws InterruptedException {
         testEventExecutorTakeTask(GlobalEventExecutor.INSTANCE);
     }
 
-    @Test(timeout = 5000L)
+    @Test
+    @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
     public void testSingleThreadEventExecutorTakeTask() throws InterruptedException {
         SingleThreadEventExecutor executor =
                 new SingleThreadEventExecutor(null, new DefaultThreadFactory("test"), true) {
@@ -125,6 +151,48 @@ public class NettyBlockHoundIntegrationTest {
         ScheduledFuture<?> f = eventExecutor.schedule(latch::countDown, 10, TimeUnit.MILLISECONDS);
         f.sync();
         latch.await();
+    }
+
+    @Test
+    @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
+    public void testSingleThreadEventExecutorAddTask() throws Exception {
+        TestLinkedBlockingQueue<Runnable> taskQueue = new TestLinkedBlockingQueue<>();
+        SingleThreadEventExecutor executor =
+                new SingleThreadEventExecutor(null, new DefaultThreadFactory("test"), true) {
+                    @Override
+                    protected Queue<Runnable> newTaskQueue(int maxPendingTasks) {
+                        return taskQueue;
+                    }
+
+                    @Override
+                    protected void run() {
+                        while (!confirmShutdown()) {
+                            Runnable task = takeTask();
+                            if (task != null) {
+                                task.run();
+                            }
+                        }
+                    }
+                };
+        taskQueue.emulateContention();
+        CountDownLatch latch = new CountDownLatch(1);
+        executor.submit(() -> {
+            executor.execute(() -> { }); // calls addTask
+            latch.countDown();
+        });
+        taskQueue.waitUntilContented();
+        taskQueue.removeContention();
+        latch.await();
+    }
+
+    @Test
+    @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
+    public void testHashedWheelTimerStartStop() throws Exception {
+        HashedWheelTimer timer = new HashedWheelTimer();
+        Future<?> futureStart = GlobalEventExecutor.INSTANCE.submit(timer::start);
+        futureStart.get(5, TimeUnit.SECONDS);
+        Future<?> futureStop = GlobalEventExecutor.INSTANCE.submit(timer::stop);
+        futureStop.get(5, TimeUnit.SECONDS);
     }
 
     // Tests copied from io.netty.handler.ssl.SslHandlerTest
@@ -183,19 +251,162 @@ public class NettyBlockHoundIntegrationTest {
     }
 
     @Test
-    public void testTrustManagerVerify() throws Exception {
-        testTrustManagerVerify("TLSv1.2");
+    public void testTrustManagerVerifyJDK() throws Exception {
+        testTrustManagerVerify(SslProvider.JDK, "TLSv1.2");
     }
 
     @Test
-    public void testTrustManagerVerifyTLSv13() throws Exception {
+    public void testTrustManagerVerifyTLSv13JDK() throws Exception {
         assumeTrue(SslProvider.isTlsv13Supported(SslProvider.JDK));
-        testTrustManagerVerify("TLSv1.3");
+        testTrustManagerVerify(SslProvider.JDK, "TLSv1.3");
     }
 
-    private static void testTrustManagerVerify(String tlsVersion) throws Exception {
+    @Test
+    public void testTrustManagerVerifyOpenSSL() throws Exception {
+        testTrustManagerVerify(SslProvider.OPENSSL, "TLSv1.2");
+    }
+
+    @Test
+    public void testTrustManagerVerifyTLSv13OpenSSL() throws Exception {
+        assumeTrue(SslProvider.isTlsv13Supported(SslProvider.OPENSSL));
+        testTrustManagerVerify(SslProvider.OPENSSL, "TLSv1.3");
+    }
+
+    @Test
+    public void testSslHandlerWrapAllowsBlockingCalls() throws Exception {
         final SslContext sslClientCtx =
                 SslContextBuilder.forClient()
+                                 .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                 .sslProvider(SslProvider.JDK)
+                                 .build();
+        final SslHandler sslHandler = sslClientCtx.newHandler(UnpooledByteBufAllocator.DEFAULT);
+        final EventLoopGroup group = new NioEventLoopGroup();
+        final CountDownLatch activeLatch = new CountDownLatch(1);
+        final AtomicReference<Throwable> error = new AtomicReference<>();
+
+        Channel sc = null;
+        Channel cc = null;
+        try {
+            sc = new ServerBootstrap()
+                    .group(group)
+                    .channel(NioServerSocketChannel.class)
+                    .childHandler(new ChannelInboundHandlerAdapter())
+                    .bind(new InetSocketAddress(0))
+                    .syncUninterruptibly()
+                    .channel();
+
+            cc = new Bootstrap()
+                    .group(group)
+                    .channel(NioSocketChannel.class)
+                    .handler(new ChannelInitializer<Channel>() {
+
+                        @Override
+                        protected void initChannel(Channel ch) {
+                            ch.pipeline().addLast(sslHandler);
+                            ch.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+
+                                @Override
+                                public void channelActive(ChannelHandlerContext ctx) {
+                                    activeLatch.countDown();
+                                }
+
+                                @Override
+                                public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+                                    if (evt instanceof SslHandshakeCompletionEvent &&
+                                            ((SslHandshakeCompletionEvent) evt).cause() != null) {
+                                        Throwable cause = ((SslHandshakeCompletionEvent) evt).cause();
+                                        cause.printStackTrace();
+                                        error.set(cause);
+                                    }
+                                    ctx.fireUserEventTriggered(evt);
+                                }
+                            });
+                        }
+                    })
+                    .connect(sc.localAddress())
+                    .addListener((ChannelFutureListener) future ->
+                        future.channel().writeAndFlush(wrappedBuffer(new byte [] { 1, 2, 3, 4 })))
+                    .syncUninterruptibly()
+                    .channel();
+
+            assertTrue(activeLatch.await(5, TimeUnit.SECONDS));
+            assertNull(error.get());
+        } finally {
+            if (cc != null) {
+                cc.close().syncUninterruptibly();
+            }
+            if (sc != null) {
+                sc.close().syncUninterruptibly();
+            }
+            group.shutdownGracefully();
+            ReferenceCountUtil.release(sslClientCtx);
+        }
+    }
+
+    @Test
+    @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
+    public void testUnixResolverDnsServerAddressStreamProvider_Parse() throws InterruptedException {
+        doTestParseResolverFilesAllowsBlockingCalls(DnsServerAddressStreamProviders::unixDefault);
+    }
+
+    @Test
+    @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
+    public void testHostsFileParser_Parse() throws InterruptedException {
+        doTestParseResolverFilesAllowsBlockingCalls(DnsNameResolverBuilder::new);
+    }
+
+    @Test
+    @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
+    public void testUnixResolverDnsServerAddressStreamProvider_ParseEtcResolverSearchDomainsAndOptions()
+            throws InterruptedException {
+        NioEventLoopGroup group = new NioEventLoopGroup();
+        try {
+            DnsNameResolverBuilder builder = new DnsNameResolverBuilder(group.next())
+                    .channelFactory(NioDatagramChannel::new);
+            doTestParseResolverFilesAllowsBlockingCalls(builder::build);
+        } finally {
+            group.shutdownGracefully();
+        }
+    }
+
+    private static void doTestParseResolverFilesAllowsBlockingCalls(Callable<Object> callable)
+            throws InterruptedException {
+        SingleThreadEventExecutor executor =
+                new SingleThreadEventExecutor(null, new DefaultThreadFactory("test"), true) {
+                    @Override
+                    protected void run() {
+                        while (!confirmShutdown()) {
+                            Runnable task = takeTask();
+                            if (task != null) {
+                                task.run();
+                            }
+                        }
+                    }
+                };
+        try {
+            CountDownLatch latch = new CountDownLatch(1);
+            List<Object> result = new ArrayList<>();
+            List<Throwable> error = new ArrayList<>();
+            executor.execute(() -> {
+                try {
+                    result.add(callable.call());
+                } catch (Throwable t) {
+                    error.add(t);
+                }
+                latch.countDown();
+            });
+            latch.await();
+            assertEquals(0, error.size());
+            assertEquals(1, result.size());
+        } finally {
+            executor.shutdownGracefully();
+        }
+    }
+
+    private static void testTrustManagerVerify(SslProvider provider, String tlsVersion) throws Exception {
+        final SslContext sslClientCtx =
+                SslContextBuilder.forClient()
+                                 .sslProvider(provider)
                                  .protocols(tlsVersion)
                                  .trustManager(ResourcesUtil.getFile(
                                          NettyBlockHoundIntegrationTest.class, "mutual_auth_ca.pem"))
@@ -207,6 +418,7 @@ public class NettyBlockHoundIntegrationTest {
                                             ResourcesUtil.getFile(
                                                     NettyBlockHoundIntegrationTest.class, "localhost_server.key"),
                                             null)
+                                 .sslProvider(provider)
                                  .protocols(tlsVersion)
                                  .build();
 
@@ -277,6 +489,36 @@ public class NettyBlockHoundIntegrationTest {
             }
             group.shutdownGracefully();
             ReferenceCountUtil.release(sslClientCtx);
+        }
+    }
+
+    private static class TestLinkedBlockingQueue<T> extends LinkedBlockingQueue<T> {
+
+        private final ReentrantLock lock = new ReentrantLock();
+
+        @Override
+        public boolean offer(T t) {
+            lock.lock();
+            try {
+                return super.offer(t);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        void emulateContention() {
+            lock.lock();
+        }
+
+        void waitUntilContented() throws InterruptedException {
+            // wait until the lock gets contended
+            while (lock.getQueueLength() == 0) {
+                Thread.sleep(10L);
+            }
+        }
+
+        void removeContention() {
+            lock.unlock();
         }
     }
 }

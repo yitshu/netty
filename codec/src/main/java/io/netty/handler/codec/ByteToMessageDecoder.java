@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -88,8 +88,8 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
             try {
                 final int required = in.readableBytes();
                 if (required > cumulation.maxWritableBytes() ||
-                        (required > cumulation.maxFastWritableBytes() && cumulation.refCnt() > 1) ||
-                        cumulation.isReadOnly()) {
+                    required > cumulation.maxFastWritableBytes() && cumulation.refCnt() > 1 ||
+                    cumulation.isReadOnly()) {
                     // Expand cumulation (by replacing it) under the following conditions:
                     // - cumulation cannot be resized to accommodate the additional data
                     // - cumulation can be expanded with a reallocation operation to accommodate but the buffer is
@@ -100,7 +100,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
                 in.readerIndex(in.writerIndex());
                 return cumulation;
             } finally {
-                // We must release in in all cases as otherwise it may produce a leak if writeBytes(...) throw
+                // We must release in all cases as otherwise it may produce a leak if writeBytes(...) throw
                 // for whatever release (for example because of OutOfMemoryError)
                 in.release();
             }
@@ -110,7 +110,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
     /**
      * Cumulate {@link ByteBuf}s by add them to a {@link CompositeByteBuf} and so do no memory copy whenever possible.
      * Be aware that {@link CompositeByteBuf} use a more complex indexing implementation so depending on your use-case
-     * and the decoder implementation this may be slower then just use the {@link #MERGE_CUMULATOR}.
+     * and the decoder implementation this may be slower than just use the {@link #MERGE_CUMULATOR}.
      */
     public static final Cumulator COMPOSITE_CUMULATOR = new Cumulator() {
         @Override
@@ -161,6 +161,8 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
      * when {@link ChannelConfig#isAutoRead()} is {@code false}.
      */
     private boolean firedChannelRead;
+
+    private boolean selfFiredChannelRead;
 
     /**
      * A bitmask where the bits are defined as
@@ -245,7 +247,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
         }
         ByteBuf buf = cumulation;
         if (buf != null) {
-            // Directly set this to null so we are sure we not access it in any other method here anymore.
+            // Directly set this to null, so we are sure we not access it in any other method here anymore.
             cumulation = null;
             numReads = 0;
             int readable = buf.readableBytes();
@@ -268,6 +270,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         if (msg instanceof ByteBuf) {
+            selfFiredChannelRead = true;
             CodecOutputList out = CodecOutputList.newInstance();
             try {
                 first = cumulation == null;
@@ -285,7 +288,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
                         cumulation.release();
                         cumulation = null;
                     } else if (++numReads >= discardAfterReads) {
-                        // We did enough reads already try to discard some bytes so we not risk to see a OOME.
+                        // We did enough reads already try to discard some bytes, so we not risk to see a OOME.
                         // See https://github.com/netty/netty/issues/4275
                         numReads = 0;
                         discardSomeReadBytes();
@@ -329,7 +332,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
     public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
         numReads = 0;
         discardSomeReadBytes();
-        if (!firedChannelRead && !ctx.channel().config().isAutoRead()) {
+        if (selfFiredChannelRead && !firedChannelRead && !ctx.channel().config().isAutoRead()) {
             ctx.read();
         }
         firedChannelRead = false;
@@ -402,7 +405,14 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
     void channelInputClosed(ChannelHandlerContext ctx, List<Object> out) throws Exception {
         if (cumulation != null) {
             callDecode(ctx, cumulation, out);
-            decodeLast(ctx, cumulation, out);
+            // If callDecode(...) removed the handle from the pipeline we should not call decodeLast(...) as this would
+            // be unexpected.
+            if (!ctx.isRemoved()) {
+                // Use Unpooled.EMPTY_BUFFER if cumulation become null after calling callDecode(...).
+                // See https://github.com/netty/netty/issues/10802.
+                ByteBuf buffer = cumulation == null ? Unpooled.EMPTY_BUFFER : cumulation;
+                decodeLast(ctx, buffer, out);
+            }
         } else {
             decodeLast(ctx, Unpooled.EMPTY_BUFFER, out);
         }
@@ -419,7 +429,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
     protected void callDecode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
         try {
             while (in.isReadable()) {
-                int outSize = out.size();
+                final int outSize = out.size();
 
                 if (outSize > 0) {
                     fireChannelRead(ctx, out, outSize);
@@ -433,7 +443,6 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
                     if (ctx.isRemoved()) {
                         break;
                     }
-                    outSize = 0;
                 }
 
                 int oldInputLength = in.readableBytes();
@@ -447,7 +456,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
                     break;
                 }
 
-                if (outSize == out.size()) {
+                if (out.isEmpty()) {
                     if (oldInputLength == in.readableBytes()) {
                         break;
                     } else {
@@ -514,7 +523,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
      * Is called one last time when the {@link ChannelHandlerContext} goes in-active. Which means the
      * {@link #channelInactive(ChannelHandlerContext)} was triggered.
      *
-     * By default this will just call {@link #decode(ChannelHandlerContext, ByteBuf, List)} but sub-classes may
+     * By default, this will just call {@link #decode(ChannelHandlerContext, ByteBuf, List)} but sub-classes may
      * override this for some special cleanup operation.
      */
     protected void decodeLast(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {

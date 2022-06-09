@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -15,8 +15,8 @@
  */
 package io.netty.buffer;
 
-import io.netty.util.collection.IntObjectHashMap;
-import io.netty.util.collection.IntObjectMap;
+import io.netty.util.internal.LongCounter;
+import io.netty.util.internal.PlatformDependent;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
@@ -133,8 +133,6 @@ import java.util.PriorityQueue;
  *
  */
 final class PoolChunk<T> implements PoolChunkMetric {
-
-    private static final int OFFSET_BIT_LENGTH = 15;
     private static final int SIZE_BIT_LENGTH = 15;
     private static final int INUSED_BIT_LENGTH = 1;
     private static final int SUBPAGE_BIT_LENGTH = 1;
@@ -146,24 +144,29 @@ final class PoolChunk<T> implements PoolChunkMetric {
     static final int RUN_OFFSET_SHIFT = SIZE_BIT_LENGTH + SIZE_SHIFT;
 
     final PoolArena<T> arena;
+    final Object base;
     final T memory;
     final boolean unpooled;
-    final int offset;
 
     /**
      * store the first page and last page of each avail run
      */
-    private final IntObjectMap<Long> runsAvailMap;
+    private final LongLongHashMap runsAvailMap;
 
     /**
      * manage all avail runs
      */
-    private final PriorityQueue<Long>[] runsAvail;
+    private final LongPriorityQueue[] runsAvail;
 
     /**
      * manage all subpages in this chunk
      */
     private final PoolSubpage<T>[] subpages;
+
+    /**
+     * Accounting of pinned memory – memory that is currently in use by ByteBuf instances.
+     */
+    private final LongCounter pinnedBytes = PlatformDependent.newLongCounter();
 
     private final int pageSize;
     private final int pageShifts;
@@ -186,18 +189,18 @@ final class PoolChunk<T> implements PoolChunkMetric {
     //private long pad0, pad1, pad2, pad3, pad4, pad5, pad6, pad7;
 
     @SuppressWarnings("unchecked")
-    PoolChunk(PoolArena<T> arena, T memory, int pageSize, int pageShifts, int chunkSize, int maxPageIdx, int offset) {
+    PoolChunk(PoolArena<T> arena, Object base, T memory, int pageSize, int pageShifts, int chunkSize, int maxPageIdx) {
         unpooled = false;
         this.arena = arena;
+        this.base = base;
         this.memory = memory;
         this.pageSize = pageSize;
         this.pageShifts = pageShifts;
         this.chunkSize = chunkSize;
-        this.offset = offset;
         freeBytes = chunkSize;
 
         runsAvail = newRunsAvailqueueArray(maxPageIdx);
-        runsAvailMap = new IntObjectHashMap<Long>();
+        runsAvailMap = new LongLongHashMap(-1);
         subpages = new PoolSubpage[chunkSize >> pageShifts];
 
         //insert initial run, offset = 0, pages = chunkSize / pageSize
@@ -209,11 +212,11 @@ final class PoolChunk<T> implements PoolChunkMetric {
     }
 
     /** Creates a special chunk that is not pooled. */
-    PoolChunk(PoolArena<T> arena, T memory, int size, int offset) {
+    PoolChunk(PoolArena<T> arena, Object base, T memory, int size) {
         unpooled = true;
         this.arena = arena;
+        this.base = base;
         this.memory = memory;
-        this.offset = offset;
         pageSize = 0;
         pageShifts = 0;
         runsAvailMap = null;
@@ -223,18 +226,17 @@ final class PoolChunk<T> implements PoolChunkMetric {
         cachedNioBuffers = null;
     }
 
-    @SuppressWarnings("unchecked")
-    private static PriorityQueue<Long>[] newRunsAvailqueueArray(int size) {
-        PriorityQueue<Long>[] queueArray = new PriorityQueue[size];
+    private static LongPriorityQueue[] newRunsAvailqueueArray(int size) {
+        LongPriorityQueue[] queueArray = new LongPriorityQueue[size];
         for (int i = 0; i < queueArray.length; i++) {
-            queueArray[i] = new PriorityQueue<Long>();
+            queueArray[i] = new LongPriorityQueue();
         }
         return queueArray;
     }
 
-    private void insertAvailRun(int runOffset, int pages, Long handle) {
+    private void insertAvailRun(int runOffset, int pages, long handle) {
         int pageIdxFloor = arena.pages2pageIdxFloor(pages);
-        PriorityQueue<Long> queue = runsAvail[pageIdxFloor];
+        LongPriorityQueue queue = runsAvail[pageIdxFloor];
         queue.offer(handle);
 
         //insert first page of run
@@ -245,18 +247,18 @@ final class PoolChunk<T> implements PoolChunkMetric {
         }
     }
 
-    private void insertAvailRun0(int runOffset, Long handle) {
-        Long pre = runsAvailMap.put(runOffset, handle);
-        assert pre == null;
+    private void insertAvailRun0(int runOffset, long handle) {
+        long pre = runsAvailMap.put(runOffset, handle);
+        assert pre == -1;
     }
 
     private void removeAvailRun(long handle) {
         int pageIdxFloor = arena.pages2pageIdxFloor(runPages(handle));
-        PriorityQueue<Long> queue = runsAvail[pageIdxFloor];
+        LongPriorityQueue queue = runsAvail[pageIdxFloor];
         removeAvailRun(queue, handle);
     }
 
-    private void removeAvailRun(PriorityQueue<Long> queue, long handle) {
+    private void removeAvailRun(LongPriorityQueue queue, long handle) {
         queue.remove(handle);
 
         int runOffset = runOffset(handle);
@@ -273,7 +275,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
         return runOffset + pages - 1;
     }
 
-    private Long getAvailRunByOffset(int runOffset) {
+    private long getAvailRunByOffset(int runOffset) {
         return runsAvailMap.get(runOffset);
     }
 
@@ -315,6 +317,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
             if (handle < 0) {
                 return false;
             }
+            assert !isSubpage(handle);
         }
 
         ByteBuffer nioBuffer = cachedNioBuffers != null? cachedNioBuffers.pollLast() : null;
@@ -334,10 +337,10 @@ final class PoolChunk<T> implements PoolChunkMetric {
             }
 
             //get run with min offset in this queue
-            PriorityQueue<Long> queue = runsAvail[queueIdx];
+            LongPriorityQueue queue = runsAvail[queueIdx];
             long handle = queue.poll();
 
-            assert !isUsed(handle);
+            assert handle != LongPriorityQueue.NO_VALUE && !isUsed(handle) : "invalid handle: " + handle;
 
             removeAvailRun(queue, handle);
 
@@ -345,7 +348,8 @@ final class PoolChunk<T> implements PoolChunkMetric {
                 handle = splitLargeRun(handle, pages);
             }
 
-            freeBytes -= runSize(pageShifts, handle);
+            int pinnedSize = runSize(pageShifts, handle);
+            freeBytes -= pinnedSize;
             return handle;
         }
     }
@@ -380,7 +384,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
             return arena.nPSizes - 1;
         }
         for (int i = pageIdx; i < arena.nPSizes; i++) {
-            PriorityQueue<Long> queue = runsAvail[i];
+            LongPriorityQueue queue = runsAvail[i];
             if (queue != null && !queue.isEmpty()) {
                 return i;
             }
@@ -435,6 +439,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
             }
 
             int runOffset = runOffset(runHandle);
+            assert subpages[runOffset] == null;
             int elemSize = arena.sizeIdx2size(sizeIdx);
 
             PoolSubpage<T> subpage = new PoolSubpage<T>(head, this, pageShifts, runOffset,
@@ -453,11 +458,13 @@ final class PoolChunk<T> implements PoolChunkMetric {
      * @param handle handle to free
      */
     void free(long handle, int normCapacity, ByteBuffer nioBuffer) {
+        int runSize = runSize(pageShifts, handle);
         if (isSubpage(handle)) {
             int sizeIdx = arena.size2SizeIdx(normCapacity);
             PoolSubpage<T> head = arena.findSubpagePoolHead(sizeIdx);
 
-            PoolSubpage<T> subpage = subpages[runOffset(handle)];
+            int sIdx = runOffset(handle);
+            PoolSubpage<T> subpage = subpages[sIdx];
             assert subpage != null && subpage.doNotDestroy;
 
             // Obtain the head of the PoolSubPage pool that is owned by the PoolArena and synchronize on it.
@@ -467,12 +474,13 @@ final class PoolChunk<T> implements PoolChunkMetric {
                     //the subpage is still used, do not free it
                     return;
                 }
+                assert !subpage.doNotDestroy;
+                // Null out slot in the array as it was freed and we should not use it anymore.
+                subpages[sIdx] = null;
             }
         }
 
         //start free run
-        int pages = runPages(handle);
-
         synchronized (runsAvail) {
             // collapse continuous runs, successfully collapsed runs
             // will be removed from runsAvail and runsAvailMap
@@ -484,7 +492,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
             finalRun &= ~(1L << IS_SUBPAGE_SHIFT);
 
             insertAvailRun(runOffset(finalRun), runPages(finalRun), finalRun);
-            freeBytes += pages << pageShifts;
+            freeBytes += runSize;
         }
 
         if (nioBuffer != null && cachedNioBuffers != null &&
@@ -502,8 +510,8 @@ final class PoolChunk<T> implements PoolChunkMetric {
             int runOffset = runOffset(handle);
             int runPages = runPages(handle);
 
-            Long pastRun = getAvailRunByOffset(runOffset - 1);
-            if (pastRun == null) {
+            long pastRun = getAvailRunByOffset(runOffset - 1);
+            if (pastRun == -1) {
                 return handle;
             }
 
@@ -526,8 +534,8 @@ final class PoolChunk<T> implements PoolChunkMetric {
             int runOffset = runOffset(handle);
             int runPages = runPages(handle);
 
-            Long nextRun = getAvailRunByOffset(runOffset + runPages);
-            if (nextRun == null) {
+            long nextRun = getAvailRunByOffset(runOffset + runPages);
+            if (nextRun == -1) {
                 return handle;
             }
 
@@ -553,11 +561,12 @@ final class PoolChunk<T> implements PoolChunkMetric {
 
     void initBuf(PooledByteBuf<T> buf, ByteBuffer nioBuffer, long handle, int reqCapacity,
                  PoolThreadCache threadCache) {
-        if (isRun(handle)) {
-            buf.init(this, nioBuffer, handle, runOffset(handle) << pageShifts,
-                     reqCapacity, runSize(pageShifts, handle), arena.parent.threadCache());
-        } else {
+        if (isSubpage(handle)) {
             initBufWithSubpage(buf, nioBuffer, handle, reqCapacity, threadCache);
+        } else {
+            int maxLength = runSize(pageShifts, handle);
+            buf.init(this, nioBuffer, handle, runOffset(handle) << pageShifts,
+                    reqCapacity, maxLength, arena.parent.threadCache());
         }
     }
 
@@ -568,11 +577,20 @@ final class PoolChunk<T> implements PoolChunkMetric {
 
         PoolSubpage<T> s = subpages[runOffset];
         assert s.doNotDestroy;
-        assert reqCapacity <= s.elemSize;
+        assert reqCapacity <= s.elemSize : reqCapacity + "<=" + s.elemSize;
 
-        buf.init(this, nioBuffer, handle,
-                 (runOffset << pageShifts) + bitmapIdx * s.elemSize + offset,
-                 reqCapacity, s.elemSize, threadCache);
+        int offset = (runOffset << pageShifts) + bitmapIdx * s.elemSize;
+        buf.init(this, nioBuffer, handle, offset, reqCapacity, s.elemSize, threadCache);
+    }
+
+    void incrementPinnedMemory(int delta) {
+        assert delta > 0;
+        pinnedBytes.add(delta);
+    }
+
+    void decrementPinnedMemory(int delta) {
+        assert delta > 0;
+        pinnedBytes.add(-delta);
     }
 
     @Override
@@ -585,6 +603,10 @@ final class PoolChunk<T> implements PoolChunkMetric {
         synchronized (arena) {
             return freeBytes;
         }
+    }
+
+    public int pinnedBytes() {
+        return (int) pinnedBytes.value();
     }
 
     @Override

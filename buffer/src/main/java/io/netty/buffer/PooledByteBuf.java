@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -52,14 +52,17 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
     }
 
     void initUnpooled(PoolChunk<T> chunk, int length) {
-        init0(chunk, null, 0, chunk.offset, length, length, null);
+        init0(chunk, null, 0, 0, length, length, null);
     }
 
     private void init0(PoolChunk<T> chunk, ByteBuffer nioBuffer,
                        long handle, int offset, int length, int maxLength, PoolThreadCache cache) {
         assert handle >= 0;
         assert chunk != null;
+        assert !PoolChunk.isSubpage(handle) || chunk.arena.size2SizeIdx(maxLength) <= chunk.arena.smallMaxSizeIdx:
+                "Allocated small sub-page handle for a buffer size that isn't \"small.\"";
 
+        chunk.incrementPinnedMemory(maxLength);
         this.chunk = chunk;
         memory = chunk.memory;
         tmpNioBuf = nioBuffer;
@@ -115,6 +118,7 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
         }
 
         // Reallocation required.
+        chunk.decrementPinnedMemory(maxLength);
         chunk.arena.reallocate(this, newCapacity, true);
         return this;
     }
@@ -168,6 +172,7 @@ abstract class PooledByteBuf<T> extends AbstractReferenceCountedByteBuf {
             final long handle = this.handle;
             this.handle = -1;
             memory = null;
+            chunk.decrementPinnedMemory(maxLength);
             chunk.arena.free(chunk, tmpNioBuf, handle, maxLength, cache);
             tmpNioBuf = null;
             chunk = null;
