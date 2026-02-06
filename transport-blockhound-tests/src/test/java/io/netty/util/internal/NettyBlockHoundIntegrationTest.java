@@ -17,6 +17,8 @@ package io.netty.util.internal;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
@@ -42,17 +44,16 @@ import io.netty.util.HashedWheelTimer;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.EventExecutor;
+import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import io.netty.util.concurrent.ImmediateEventExecutor;
 import io.netty.util.concurrent.ImmediateExecutor;
 import io.netty.util.concurrent.ScheduledFuture;
 import io.netty.util.concurrent.SingleThreadEventExecutor;
 import io.netty.util.internal.Hidden.NettyBlockHoundIntegration;
-import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.api.condition.DisabledIf;
 import reactor.blockhound.BlockHound;
 import reactor.blockhound.BlockingOperationError;
 import reactor.blockhound.integration.BlockHoundIntegration;
@@ -72,23 +73,19 @@ import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
 import static io.netty.buffer.Unpooled.wrappedBuffer;
-import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-@DisabledIf("isDisabledIfJavaVersion18OrAbove")
 public class NettyBlockHoundIntegrationTest {
-
-    private static boolean isDisabledIfJavaVersion18OrAbove() {
-        return PlatformDependent.javaVersion() >= 18;
-    }
 
     @BeforeAll
     public static void setUpClass() {
@@ -118,7 +115,7 @@ public class NettyBlockHoundIntegrationTest {
             future.get(5, TimeUnit.SECONDS);
             fail("Expected an exception due to a blocking call but none was thrown");
         } catch (ExecutionException e) {
-            assertThat(e.getCause(), Matchers.instanceOf(BlockingOperationError.class));
+            assertInstanceOf(BlockingOperationError.class, e.getCause());
         }
     }
 
@@ -186,6 +183,23 @@ public class NettyBlockHoundIntegrationTest {
     }
 
     @Test
+    void permittingBlockingCallsInFastThreadLocalThreadSubclass() throws Exception {
+        final FutureTask<Void> future = new FutureTask<>(() -> {
+            Thread.sleep(0);
+            return null;
+        });
+        FastThreadLocalThread thread = new FastThreadLocalThread(future) {
+            @Override
+            public boolean permitBlockingCalls() {
+                return true; // The Thread.sleep(0) call should not be flagged because we allow blocking calls.
+            }
+        };
+        thread.start();
+        future.get(5, TimeUnit.SECONDS);
+        thread.join();
+    }
+
+    @Test
     @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
     public void testHashedWheelTimerStartStop() throws Exception {
         HashedWheelTimer timer = new HashedWheelTimer();
@@ -236,6 +250,7 @@ public class NettyBlockHoundIntegrationTest {
             testHandshakeWithExecutor(executorService, "TLSv1.2");
         } finally {
             executorService.shutdown();
+            assertTrue(executorService.awaitTermination(5, TimeUnit.SECONDS));
         }
     }
 
@@ -247,6 +262,7 @@ public class NettyBlockHoundIntegrationTest {
             testHandshakeWithExecutor(executorService, "TLSv1.3");
         } finally {
             executorService.shutdown();
+            assertTrue(executorService.awaitTermination(5, TimeUnit.SECONDS));
         }
     }
 
@@ -345,6 +361,36 @@ public class NettyBlockHoundIntegrationTest {
 
     @Test
     @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
+    public void pooledBufferAllocation() throws Exception {
+        AtomicLong iterationCounter = new AtomicLong();
+        PooledByteBufAllocator allocator = PooledByteBufAllocator.DEFAULT;
+        FutureTask<Void> task = new FutureTask<>(() -> {
+            List<ByteBuf> buffers = new ArrayList<>();
+            long count;
+            do {
+                count = iterationCounter.get();
+            } while (count == 0);
+            for (int i = 0; i < 13; i++) {
+                int size = 8 << i;
+                buffers.add(allocator.ioBuffer(size, size));
+            }
+            for (ByteBuf buffer : buffers) {
+                buffer.release();
+            }
+            return null;
+        });
+        FastThreadLocalThread thread = new FastThreadLocalThread(task);
+        thread.start();
+        do {
+            allocator.dumpStats(); // This will take internal pool locks and we'll race with the thread.
+            iterationCounter.set(1);
+        } while (thread.isAlive());
+        thread.join();
+        task.get();
+    }
+
+    @Test
+    @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
     public void testUnixResolverDnsServerAddressStreamProvider_Parse() throws InterruptedException {
         doTestParseResolverFilesAllowsBlockingCalls(DnsServerAddressStreamProviders::unixDefault);
     }
@@ -362,7 +408,7 @@ public class NettyBlockHoundIntegrationTest {
         NioEventLoopGroup group = new NioEventLoopGroup();
         try {
             DnsNameResolverBuilder builder = new DnsNameResolverBuilder(group.next())
-                    .channelFactory(NioDatagramChannel::new);
+                    .datagramChannelFactory(NioDatagramChannel::new);
             doTestParseResolverFilesAllowsBlockingCalls(builder::build);
         } finally {
             group.shutdownGracefully();

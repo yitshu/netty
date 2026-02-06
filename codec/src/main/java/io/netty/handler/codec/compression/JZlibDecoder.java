@@ -28,13 +28,16 @@ public class JZlibDecoder extends ZlibDecoder {
 
     private final Inflater z = new Inflater();
     private byte[] dictionary;
+    private boolean needsRead;
     private volatile boolean finished;
 
     /**
      * Creates a new instance with the default wrapper ({@link ZlibWrapper#ZLIB}).
      *
      * @throws DecompressionException if failed to initialize zlib
+     * @deprecated Use {@link JZlibDecoder#JZlibDecoder(int)}.
      */
+    @Deprecated
     public JZlibDecoder() {
         this(ZlibWrapper.ZLIB, 0);
     }
@@ -57,7 +60,9 @@ public class JZlibDecoder extends ZlibDecoder {
      * Creates a new instance with the specified wrapper.
      *
      * @throws DecompressionException if failed to initialize zlib
+     * @deprecated Use {@link JZlibDecoder#JZlibDecoder(ZlibWrapper, int)}.
      */
+    @Deprecated
     public JZlibDecoder(ZlibWrapper wrapper) {
         this(wrapper, 0);
     }
@@ -88,7 +93,9 @@ public class JZlibDecoder extends ZlibDecoder {
      * supports the preset dictionary.
      *
      * @throws DecompressionException if failed to initialize zlib
+     * @deprecated Use {@link JZlibDecoder#JZlibDecoder(byte[], int)}.
      */
+    @Deprecated
     public JZlibDecoder(byte[] dictionary) {
         this(dictionary, 0);
     }
@@ -125,6 +132,7 @@ public class JZlibDecoder extends ZlibDecoder {
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+        needsRead = true;
         if (finished) {
             // Skip data received after finished.
             in.skipBytes(in.readableBytes());
@@ -166,6 +174,14 @@ public class JZlibDecoder extends ZlibDecoder {
                     int outputLength = z.next_out_index - oldNextOutIndex;
                     if (outputLength > 0) {
                         decompressed.writerIndex(decompressed.writerIndex() + outputLength);
+                        if (maxAllocation == 0) {
+                            // If we don't limit the maximum allocations we should just
+                            // forward the buffer directly.
+                            ByteBuf buffer = decompressed;
+                            decompressed = null;
+                            needsRead = false;
+                            ctx.fireChannelRead(buffer);
+                        }
                     }
 
                     switch (resultCode) {
@@ -196,10 +212,13 @@ public class JZlibDecoder extends ZlibDecoder {
                 }
             } finally {
                 in.skipBytes(z.next_in_index - oldNextInIndex);
-                if (decompressed.isReadable()) {
-                    out.add(decompressed);
-                } else {
-                    decompressed.release();
+                if (decompressed != null) {
+                    if (decompressed.isReadable()) {
+                        needsRead = false;
+                        ctx.fireChannelRead(decompressed);
+                    } else {
+                        decompressed.release();
+                    }
                 }
             }
         } finally {
@@ -210,6 +229,17 @@ public class JZlibDecoder extends ZlibDecoder {
             z.next_in = null;
             z.next_out = null;
         }
+    }
+
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        // Discard bytes of the cumulation buffer if needed.
+        discardSomeReadBytes();
+
+        if (needsRead && !ctx.channel().config().isAutoRead()) {
+            ctx.read();
+        }
+        ctx.fireChannelReadComplete();
     }
 
     @Override

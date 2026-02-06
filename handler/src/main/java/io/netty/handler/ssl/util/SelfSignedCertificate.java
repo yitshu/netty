@@ -63,10 +63,10 @@ public final class SelfSignedCertificate {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(SelfSignedCertificate.class);
 
     /** Current time minus 1 year, just in case software clock goes back due to time synchronization */
-    private static final Date DEFAULT_NOT_BEFORE = new Date(SystemPropertyUtil.getLong(
+    static final Date DEFAULT_NOT_BEFORE = new Date(SystemPropertyUtil.getLong(
             "io.netty.selfSignedCertificate.defaultNotBefore", System.currentTimeMillis() - 86400000L * 365));
     /** The maximum possible value in X.509 specification: 9999-12-31 23:59:59 */
-    private static final Date DEFAULT_NOT_AFTER = new Date(SystemPropertyUtil.getLong(
+    static final Date DEFAULT_NOT_AFTER = new Date(SystemPropertyUtil.getLong(
             "io.netty.selfSignedCertificate.defaultNotAfter", 253402300799000L));
 
     /**
@@ -74,7 +74,7 @@ public final class SelfSignedCertificate {
      * Let's use that as a sane default but allow the default to be set dynamically
      * for those that need more stringent security requirements.
      */
-    private static final int DEFAULT_KEY_LENGTH_BITS =
+    static final int DEFAULT_KEY_LENGTH_BITS =
             SystemPropertyUtil.getInt("io.netty.handler.ssl.util.selfSignedKeyStrength", 2048);
 
     private final File certificate;
@@ -240,7 +240,12 @@ public final class SelfSignedCertificate {
             paths = BouncyCastleSelfSignedCertGenerator.generate(
                     fqdn, keypair, random, notBefore, notAfter, algorithm);
         } catch (Throwable t) {
-            logger.debug("Failed to generate a self-signed X.509 certificate using Bouncy Castle:", t);
+            if (!isBouncyCastleAvailable()) {
+                logger.debug("Failed to generate a self-signed X.509 certificate because " +
+                        "BouncyCastle PKIX is not available in classpath");
+            } else {
+                logger.debug("Failed to generate a self-signed X.509 certificate using Bouncy Castle:", t);
+            }
             try {
                 // Try the OpenJDK's proprietary implementation.
                 paths = OpenJdkSelfSignedCertGenerator.generate(fqdn, keypair, random, notBefore, notAfter, algorithm);
@@ -399,6 +404,16 @@ public final class SelfSignedCertificate {
             if (logger.isWarnEnabled()) {
                 logger.warn("Failed to close a file: " + keyFile, e);
             }
+        }
+    }
+
+    private static boolean isBouncyCastleAvailable() {
+        try {
+            // this class is in bcpkix, both fips and non-fips
+            Class.forName("org.bouncycastle.cert.X509v3CertificateBuilder");
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
         }
     }
 }

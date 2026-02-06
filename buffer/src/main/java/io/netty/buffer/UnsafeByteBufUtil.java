@@ -34,6 +34,7 @@ import static io.netty.util.internal.PlatformDependent.BIG_ENDIAN_NATIVE_ORDER;
 final class UnsafeByteBufUtil {
     private static final boolean UNALIGNED = PlatformDependent.isUnaligned();
     private static final byte ZERO = 0;
+    private static final int MAX_HAND_ROLLED_SET_ZERO_BYTES = 64;
 
     static byte getByte(long address) {
         return PlatformDependent.getByte(address);
@@ -424,11 +425,28 @@ final class UnsafeByteBufUtil {
         }
     }
 
+    private static void batchSetZero(byte[] data, int index, int length) {
+        int longBatches = length / 8;
+        for (int i = 0; i < longBatches; i++) {
+            PlatformDependent.putLong(data, index, ZERO);
+            index += 8;
+        }
+        final int remaining = length % 8;
+        for (int i = 0; i < remaining; i++) {
+            PlatformDependent.putByte(data, index + i, ZERO);
+        }
+    }
+
     static void setZero(byte[] array, int index, int length) {
         if (length == 0) {
             return;
         }
-        PlatformDependent.setMemory(array, index, length, ZERO);
+        // fast-path for small writes to avoid thread-state change JDK's handling
+        if (UNALIGNED && length <= MAX_HAND_ROLLED_SET_ZERO_BYTES) {
+            batchSetZero(array, index, length);
+        } else {
+            PlatformDependent.setMemory(array, index, length, ZERO);
+        }
     }
 
     static ByteBuf copy(AbstractByteBuf buf, long addr, int index, int length) {
@@ -618,20 +636,67 @@ final class UnsafeByteBufUtil {
         } while (outLen > 0);
     }
 
+    private static void batchSetZero(long addr, int length) {
+        int longBatches = length / 8;
+        for (int i = 0; i < longBatches; i++) {
+            PlatformDependent.putLong(addr, ZERO);
+            addr += 8;
+        }
+        final int remaining = length % 8;
+        for (int i = 0; i < remaining; i++) {
+            PlatformDependent.putByte(addr + i, ZERO);
+        }
+    }
+
     static void setZero(long addr, int length) {
         if (length == 0) {
             return;
         }
+        // fast-path for small writes to avoid thread-state change JDK's handling
+        if (length <= MAX_HAND_ROLLED_SET_ZERO_BYTES) {
+            if (!UNALIGNED) {
+                // write bytes until the address is aligned
+                int bytesToGetAligned = zeroTillAligned(addr, length);
+                addr += bytesToGetAligned;
+                length -= bytesToGetAligned;
+                if (length == 0) {
+                    return;
+                }
+                assert is8BytesAligned(addr);
+            }
+            batchSetZero(addr, length);
+        } else {
+            PlatformDependent.setMemory(addr, length, ZERO);
+        }
+    }
 
-        PlatformDependent.setMemory(addr, length, ZERO);
+    static long next8bytesAlignedAddr(long addr) {
+        return (addr + 7L) & ~7L;
+    }
+
+    static boolean is8BytesAligned(long addr) {
+        return (addr & 7L) == 0;
+    }
+
+    private static int zeroTillAligned(long addr, int length) {
+        long alignedAddr = next8bytesAlignedAddr(addr);
+        int bytesToGetAligned = (int) (alignedAddr - addr);
+        int toZero = Math.min(bytesToGetAligned, length);
+        for (int i = 0; i < toZero; i++) {
+            PlatformDependent.putByte(addr + i, ZERO);
+        }
+        return toZero;
     }
 
     static UnpooledUnsafeDirectByteBuf newUnsafeDirectByteBuf(
-            ByteBufAllocator alloc, int initialCapacity, int maxCapacity) {
+            ByteBufAllocator alloc, int initialCapacity, int maxCapacity,
+            boolean allowSectionedInternalNioBufferAccess) {
         if (PlatformDependent.useDirectBufferNoCleaner()) {
-            return new UnpooledUnsafeNoCleanerDirectByteBuf(alloc, initialCapacity, maxCapacity);
+            return new UnpooledUnsafeNoCleanerDirectByteBuf(
+                    alloc, initialCapacity, maxCapacity, allowSectionedInternalNioBufferAccess);
         }
-        return new UnpooledUnsafeDirectByteBuf(alloc, initialCapacity, maxCapacity);
+        return new UnpooledUnsafeDirectByteBuf(
+                alloc, initialCapacity, maxCapacity, allowSectionedInternalNioBufferAccess);
     }
 
     private UnsafeByteBufUtil() { }

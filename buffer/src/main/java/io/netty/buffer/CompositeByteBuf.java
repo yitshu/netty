@@ -1720,7 +1720,7 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
                 i ++;
             }
 
-            return buffers.toArray(new ByteBuffer[0]);
+            return buffers.toArray(EmptyArrays.EMPTY_BYTE_BUFFERS);
         } finally {
             buffers.recycle();
         }
@@ -2359,5 +2359,18 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
             System.arraycopy(components, i, components, i + count, size - i);
         }
         componentCount = newSize;
+    }
+
+    /**
+     * Decreases the reference count by the specified {@code decrement} and deallocates this object if the reference
+     * count reaches at {@code 0}. At this point it will also decrement the reference count of each internal
+     * component by {@code 1}.
+     *
+     * @param decrement the number by which the reference count should be decreased
+     * @return {@code true} if and only if the reference count became {@code 0} and this object has been deallocated
+     */
+    @Override
+    public boolean release(final int decrement) {
+        return super.release(decrement);
     }
 }

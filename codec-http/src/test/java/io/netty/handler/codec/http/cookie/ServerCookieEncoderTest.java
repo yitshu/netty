@@ -15,8 +15,7 @@
  */
 package io.netty.handler.codec.http.cookie;
 
-import static org.hamcrest.CoreMatchers.containsString;
-import static org.hamcrest.MatcherAssert.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -44,13 +43,14 @@ public class ServerCookieEncoderTest {
         int maxAge = 50;
 
         String result = "myCookie=myValue; Max-Age=50; Expires=(.+?); Path=/apathsomewhere;" +
-                " Domain=.adomainsomewhere; Secure; SameSite=Lax";
+                " Domain=.adomainsomewhere; Secure; SameSite=Lax; Partitioned";
         DefaultCookie cookie = new DefaultCookie("myCookie", "myValue");
         cookie.setDomain(".adomainsomewhere");
         cookie.setMaxAge(maxAge);
         cookie.setPath("/apathsomewhere");
         cookie.setSecure(true);
         cookie.setSameSite(SameSite.Lax);
+        cookie.setPartitioned(true);
 
         String encodedCookie = ServerCookieEncoder.STRICT.encode(cookie);
 
@@ -141,7 +141,7 @@ public class ServerCookieEncoderTest {
         try {
             ServerCookieEncoder.STRICT.encode(new DefaultCookie("name", "\"value,\""));
         } catch (IllegalArgumentException e) {
-            assertThat(e.getMessage().toLowerCase(), containsString("cookie value contains an invalid char: ,"));
+            assertThat(e.getMessage().toLowerCase()).contains("cookie value contains an invalid char: ,");
         }
     }
 

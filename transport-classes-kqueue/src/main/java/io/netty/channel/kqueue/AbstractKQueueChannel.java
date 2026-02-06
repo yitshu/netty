@@ -68,6 +68,7 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
     final BsdSocket socket;
     private boolean readFilterEnabled;
     private boolean writeFilterEnabled;
+    KQueueEventLoop.KQueueRegistration registration;
     boolean readReadyRunnablePending;
     boolean inputClosedSeenErrorOnRead;
     protected volatile boolean active;
@@ -150,7 +151,9 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
 
     @Override
     protected void doDeregister() throws Exception {
-        ((KQueueEventLoop) eventLoop()).remove(this);
+        if (registration != null) {
+            registration.remove();
+        }
 
         // As unregisteredFilters() may have not been called because isOpen() returned false we just set both filters
         // to false to ensure a consistent state in all cases.
@@ -162,7 +165,11 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
         // Make sure we unregister our filters from kqueue!
         readFilter(false);
         writeFilter(false);
-        evSet0(Native.EVFILT_SOCK, Native.EV_DELETE, 0);
+        clearRdHup0();
+    }
+
+    private void clearRdHup0() {
+        evSet0(Native.EVFILT_SOCK, Native.EV_DELETE_DISABLE, Native.NOTE_RDHUP);
     }
 
     @Override
@@ -190,7 +197,7 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
         // new EventLoop.
         readReadyRunnablePending = false;
 
-        ((KQueueEventLoop) eventLoop()).add(this);
+        registration = ((KQueueEventLoop) eventLoop()).add(this);
 
         // Add the write event first so we get notified of connection refused on the client side!
         if (writeFilterEnabled) {
@@ -359,8 +366,8 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
 
     private void evSet0(short filter, short flags, int fflags) {
         // Only try to add to changeList if the FD is still open, if not we already closed it in the meantime.
-        if (isOpen()) {
-            ((KQueueEventLoop) eventLoop()).evSet(this, filter, flags, fflags);
+        if (isOpen() && registration != null) {
+            registration.evSet(filter, flags, fflags, 0);
         }
     }
 
@@ -443,7 +450,7 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
          */
         void shutdownInput(boolean readEOF) {
             // We need to take special care of calling finishConnect() if readEOF is true and we not
-            // fullfilled the connectPromise yet. If we fail to do so the connectPromise will be failed
+            // fulfilled the connectPromise yet. If we fail to do so the connectPromise will be failed
             // with a ClosedChannelException as a close() will happen and so the FD is closed before we
             // have a chance to call finishConnect() later on. Calling finishConnect() here will ensure
             // we observe the correct exception in case of a connect failure.
@@ -463,11 +470,12 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
                         // We attempted to shutdown and failed, which means the input has already effectively been
                         // shutdown.
                     }
+                    clearReadFilter0();
                     pipeline().fireUserEventTriggered(ChannelInputShutdownEvent.INSTANCE);
                 } else {
                     close(voidPromise());
                 }
-            } else if (!readEOF) {
+            } else if (!readEOF && !inputClosedSeenErrorOnRead) {
                 inputClosedSeenErrorOnRead = true;
                 pipeline().fireUserEventTriggered(ChannelInputShutdownReadComplete.INSTANCE);
             }
@@ -487,6 +495,9 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
                 // Just to be safe make sure the input marked as closed.
                 shutdownInput(true);
             }
+
+            // Clear the RDHUP flag to prevent continuously getting woken up on this event.
+            clearRdHup0();
         }
 
         @Override
@@ -537,7 +548,9 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
         @Override
         public void connect(
                 final SocketAddress remoteAddress, final SocketAddress localAddress, final ChannelPromise promise) {
-            if (!promise.setUncancellable() || !ensureOpen(promise)) {
+            // Don't mark the connect promise as uncancellable as in fact we can cancel it as it is using
+            // non-blocking io.
+            if (promise.isDone() || !ensureOpen(promise)) {
                 return;
             }
 
@@ -554,7 +567,7 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
                     requestedRemoteAddress = remoteAddress;
 
                     // Schedule connect timeout.
-                    int connectTimeoutMillis = config().getConnectTimeoutMillis();
+                    final int connectTimeoutMillis = config().getConnectTimeoutMillis();
                     if (connectTimeoutMillis > 0) {
                         connectTimeoutFuture = eventLoop().schedule(new Runnable() {
                             @Override
@@ -562,7 +575,8 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
                                 ChannelPromise connectPromise = AbstractKQueueChannel.this.connectPromise;
                                 if (connectPromise != null && !connectPromise.isDone()
                                         && connectPromise.tryFailure(new ConnectTimeoutException(
-                                        "connection timed out: " + remoteAddress))) {
+                                                "connection timed out after " + connectTimeoutMillis + " ms: " +
+                                                        remoteAddress))) {
                                     close(voidPromise());
                                 }
                             }
@@ -571,7 +585,9 @@ abstract class AbstractKQueueChannel extends AbstractChannel implements UnixChan
 
                     promise.addListener(new ChannelFutureListener() {
                         @Override
-                        public void operationComplete(ChannelFuture future) throws Exception {
+                        public void operationComplete(ChannelFuture future) {
+                            // If the connect future is cancelled we also cancel the timeout and close the
+                            // underlying socket.
                             if (future.isCancelled()) {
                                 if (connectTimeoutFuture != null) {
                                     connectTimeoutFuture.cancel(false);

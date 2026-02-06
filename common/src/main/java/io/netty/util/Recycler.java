@@ -16,12 +16,15 @@
 package io.netty.util;
 
 import io.netty.util.concurrent.FastThreadLocal;
+import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.internal.ObjectPool;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
+import io.netty.util.internal.UnstableApi;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import org.jctools.queues.MessagePassingQueue;
+import org.jetbrains.annotations.VisibleForTesting;
 
 import java.util.ArrayDeque;
 import java.util.Queue;
@@ -38,9 +41,14 @@ import static java.lang.Math.min;
  */
 public abstract class Recycler<T> {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(Recycler.class);
-    private static final Handle<?> NOOP_HANDLE = new Handle<Object>() {
+    private static final EnhancedHandle<?> NOOP_HANDLE = new EnhancedHandle<Object>() {
         @Override
         public void recycle(Object object) {
+            // NOOP
+        }
+
+        @Override
+        public void unguardedRecycle(final Object object) {
             // NOOP
         }
 
@@ -54,6 +62,7 @@ public abstract class Recycler<T> {
     private static final int RATIO;
     private static final int DEFAULT_QUEUE_CHUNK_SIZE_PER_THREAD;
     private static final boolean BLOCKING_POOL;
+    private static final boolean BATCH_FAST_TL_ONLY;
 
     static {
         // In the future, we might have different maxCapacity for different object types.
@@ -68,12 +77,13 @@ public abstract class Recycler<T> {
         DEFAULT_MAX_CAPACITY_PER_THREAD = maxCapacityPerThread;
         DEFAULT_QUEUE_CHUNK_SIZE_PER_THREAD = SystemPropertyUtil.getInt("io.netty.recycler.chunkSize", 32);
 
-        // By default we allow one push to a Recycler for each 8th try on handles that were never recycled before.
+        // By default, we allow one push to a Recycler for each 8th try on handles that were never recycled before.
         // This should help to slowly increase the capacity of the recycler while not be too sensitive to allocation
         // bursts.
         RATIO = max(0, SystemPropertyUtil.getInt("io.netty.recycler.ratio", 8));
 
         BLOCKING_POOL = SystemPropertyUtil.getBoolean("io.netty.recycler.blocking", false);
+        BATCH_FAST_TL_ONLY = SystemPropertyUtil.getBoolean("io.netty.recycler.batchFastThreadLocalOnly", true);
 
         if (logger.isDebugEnabled()) {
             if (DEFAULT_MAX_CAPACITY_PER_THREAD == 0) {
@@ -81,11 +91,13 @@ public abstract class Recycler<T> {
                 logger.debug("-Dio.netty.recycler.ratio: disabled");
                 logger.debug("-Dio.netty.recycler.chunkSize: disabled");
                 logger.debug("-Dio.netty.recycler.blocking: disabled");
+                logger.debug("-Dio.netty.recycler.batchFastThreadLocalOnly: disabled");
             } else {
                 logger.debug("-Dio.netty.recycler.maxCapacityPerThread: {}", DEFAULT_MAX_CAPACITY_PER_THREAD);
                 logger.debug("-Dio.netty.recycler.ratio: {}", RATIO);
                 logger.debug("-Dio.netty.recycler.chunkSize: {}", DEFAULT_QUEUE_CHUNK_SIZE_PER_THREAD);
                 logger.debug("-Dio.netty.recycler.blocking: {}", BLOCKING_POOL);
+                logger.debug("-Dio.netty.recycler.batchFastThreadLocalOnly: {}", BATCH_FAST_TL_ONLY);
             }
         }
     }
@@ -104,6 +116,7 @@ public abstract class Recycler<T> {
             super.onRemoval(value);
             MessagePassingQueue<DefaultHandle<T>> handles = value.pooledHandles;
             value.pooledHandles = null;
+            value.owner = null;
             handles.clear();
         }
     };
@@ -161,7 +174,7 @@ public abstract class Recycler<T> {
 
     @SuppressWarnings("unchecked")
     public final T get() {
-        if (maxCapacityPerThread == 0) {
+        if (maxCapacityPerThread == 0 || PlatformDependent.isVirtualThread(Thread.currentThread())) {
             return newObject((Handle<T>) NOOP_HANDLE);
         }
         LocalPool<T> localPool = threadLocal.get();
@@ -195,16 +208,33 @@ public abstract class Recycler<T> {
         return true;
     }
 
+    @VisibleForTesting
     final int threadLocalSize() {
-        return threadLocal.get().pooledHandles.size();
+        if (PlatformDependent.isVirtualThread(Thread.currentThread())) {
+            return 0;
+        }
+        LocalPool<T> localPool = threadLocal.getIfExists();
+        return localPool == null ? 0 : localPool.pooledHandles.size() + localPool.batch.size();
     }
 
+    /**
+     * @param handle can NOT be null.
+     */
     protected abstract T newObject(Handle<T> handle);
 
     @SuppressWarnings("ClassNameSameAsAncestorName") // Can't change this due to compatibility.
     public interface Handle<T> extends ObjectPool.Handle<T>  { }
 
-    private static final class DefaultHandle<T> implements Handle<T> {
+    @UnstableApi
+    public abstract static class EnhancedHandle<T> implements Handle<T> {
+
+        public abstract void unguardedRecycle(Object object);
+
+        private EnhancedHandle() {
+        }
+    }
+
+    private static final class DefaultHandle<T> extends EnhancedHandle<T> {
         private static final int STATE_CLAIMED = 0;
         private static final int STATE_AVAILABLE = 1;
         private static final AtomicIntegerFieldUpdater<DefaultHandle<?>> STATE_UPDATER;
@@ -214,7 +244,6 @@ public abstract class Recycler<T> {
             STATE_UPDATER = (AtomicIntegerFieldUpdater<DefaultHandle<?>>) updater;
         }
 
-        @SuppressWarnings({"FieldMayBeFinal", "unused"}) // Updated by STATE_UPDATER.
         private volatile int state; // State is initialised to STATE_CLAIMED (aka. 0) so they can be released.
         private final LocalPool<T> localPool;
         private T value;
@@ -228,7 +257,15 @@ public abstract class Recycler<T> {
             if (object != value) {
                 throw new IllegalArgumentException("object does not belong to handle");
             }
-            localPool.release(this);
+            localPool.release(this, true);
+        }
+
+        @Override
+        public void unguardedRecycle(Object object) {
+            if (object != value) {
+                throw new IllegalArgumentException("object does not belong to handle");
+            }
+            localPool.release(this, false);
         }
 
         T get() {
@@ -239,11 +276,9 @@ public abstract class Recycler<T> {
             this.value = value;
         }
 
-        boolean availableToClaim() {
-            if (state != STATE_AVAILABLE) {
-                return false;
-            }
-            return STATE_UPDATER.compareAndSet(this, STATE_AVAILABLE, STATE_CLAIMED);
+        void toClaimed() {
+            assert state == STATE_AVAILABLE;
+            STATE_UPDATER.lazySet(this, STATE_CLAIMED);
         }
 
         void toAvailable() {
@@ -252,16 +287,31 @@ public abstract class Recycler<T> {
                 throw new IllegalStateException("Object has been recycled already.");
             }
         }
+
+        void unguardedToAvailable() {
+            int prev = state;
+            if (prev == STATE_AVAILABLE) {
+                throw new IllegalStateException("Object has been recycled already.");
+            }
+            STATE_UPDATER.lazySet(this, STATE_AVAILABLE);
+        }
     }
 
-    private static final class LocalPool<T> {
+    private static final class LocalPool<T> implements MessagePassingQueue.Consumer<DefaultHandle<T>> {
         private final int ratioInterval;
+        private final int chunkSize;
+        private final ArrayDeque<DefaultHandle<T>> batch;
+        private volatile Thread owner;
         private volatile MessagePassingQueue<DefaultHandle<T>> pooledHandles;
         private int ratioCounter;
 
         @SuppressWarnings("unchecked")
         LocalPool(int maxCapacity, int ratioInterval, int chunkSize) {
             this.ratioInterval = ratioInterval;
+            this.chunkSize = chunkSize;
+            batch = new ArrayDeque<DefaultHandle<T>>(chunkSize);
+            Thread currentThread = Thread.currentThread();
+            owner = !BATCH_FAST_TL_ONLY || currentThread instanceof FastThreadLocalThread ? currentThread : null;
             if (BLOCKING_POOL) {
                 pooledHandles = new BlockingMessageQueue<DefaultHandle<T>>(maxCapacity);
             } else {
@@ -275,19 +325,40 @@ public abstract class Recycler<T> {
             if (handles == null) {
                 return null;
             }
-            DefaultHandle<T> handle;
-            do {
-                handle = handles.relaxedPoll();
-            } while (handle != null && !handle.availableToClaim());
+            if (batch.isEmpty()) {
+                handles.drain(this, chunkSize);
+            }
+            DefaultHandle<T> handle = batch.pollLast();
+            if (null != handle) {
+                handle.toClaimed();
+            }
             return handle;
         }
 
-        void release(DefaultHandle<T> handle) {
-            MessagePassingQueue<DefaultHandle<T>> handles = pooledHandles;
-            handle.toAvailable();
-            if (handles != null) {
-                handles.relaxedOffer(handle);
+        void release(DefaultHandle<T> handle, boolean guarded) {
+            if (guarded) {
+                handle.toAvailable();
+            } else {
+                handle.unguardedToAvailable();
             }
+            Thread owner = this.owner;
+            if (owner != null && Thread.currentThread() == owner && batch.size() < chunkSize) {
+                accept(handle);
+            } else if (owner != null && isTerminated(owner)) {
+                this.owner = null;
+                pooledHandles = null;
+            } else {
+                MessagePassingQueue<DefaultHandle<T>> handles = pooledHandles;
+                if (handles != null) {
+                    handles.relaxedOffer(handle);
+                }
+            }
+        }
+
+        private static boolean isTerminated(Thread owner) {
+            // Do not use `Thread.getState()` in J9 JVM because it's known to have a performance issue.
+            // See: https://github.com/netty/netty/issues/13347#issuecomment-1518537895
+            return PlatformDependent.isJ9Jvm() ? !owner.isAlive() : owner.getState() == Thread.State.TERMINATED;
         }
 
         DefaultHandle<T> newHandle() {
@@ -297,13 +368,18 @@ public abstract class Recycler<T> {
             }
             return null;
         }
+
+        @Override
+        public void accept(DefaultHandle<T> e) {
+            batch.addLast(e);
+        }
     }
 
     /**
      * This is an implementation of {@link MessagePassingQueue}, similar to what might be returned from
      * {@link PlatformDependent#newMpscQueue(int)}, but intended to be used for debugging purpose.
      * The implementation relies on synchronised monitor locks for thread-safety.
-     * The {@code drain} and {@code fill} bulk operations are not supported by this implementation.
+     * The {@code fill} bulk operation is not supported by this implementation.
      */
     private static final class BlockingMessageQueue<T> implements MessagePassingQueue<T> {
         private final Queue<T> deque;
@@ -378,7 +454,12 @@ public abstract class Recycler<T> {
 
         @Override
         public int drain(Consumer<T> c, int limit) {
-            throw new UnsupportedOperationException();
+            T obj;
+            int i = 0;
+            for (; i < limit && (obj = poll()) != null; i++) {
+                c.accept(obj);
+            }
+            return i;
         }
 
         @Override

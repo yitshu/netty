@@ -32,6 +32,7 @@ import io.netty.channel.ChannelPromise;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.FutureListener;
+import io.netty.util.concurrent.ScheduledFuture;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -674,6 +675,119 @@ public class EmbeddedChannelTest {
         } catch (Throwable t) {
             fail("Channel should not throw an exception for pending tasks if it is not registered", t);
         }
+    }
+
+    @Test
+    @Timeout(30) // generous timeout, just make sure we don't actually wait for the full 10 mins...
+    void testAdvanceTime() {
+        EmbeddedChannel channel = new EmbeddedChannel();
+        Runnable runnable = new Runnable() {
+            @Override
+            public void run() {
+            }
+        };
+        ScheduledFuture<?> future10 = channel.eventLoop().schedule(runnable, 10, TimeUnit.MINUTES);
+        ScheduledFuture<?> future20 = channel.eventLoop().schedule(runnable, 20, TimeUnit.MINUTES);
+
+        channel.runPendingTasks();
+        assertFalse(future10.isDone());
+        assertFalse(future20.isDone());
+
+        channel.advanceTimeBy(10, TimeUnit.MINUTES);
+        channel.runPendingTasks();
+        assertTrue(future10.isDone());
+        assertFalse(future20.isDone());
+    }
+
+    @Test
+    @Timeout(30) // generous timeout, just make sure we don't actually wait for the full 10 mins...
+    void testFreezeTime() {
+        EmbeddedChannel channel = new EmbeddedChannel();
+        Runnable runnable = new Runnable() {
+            @Override
+            public void run() {
+            }
+        };
+
+        channel.freezeTime();
+        // this future will complete after 10min
+        ScheduledFuture<?> future10 = channel.eventLoop().schedule(runnable, 10, TimeUnit.MINUTES);
+        // this future will complete after 10min + 1ns
+        ScheduledFuture<?> future101 = channel.eventLoop().schedule(runnable,
+                TimeUnit.MINUTES.toNanos(10) + 1, TimeUnit.NANOSECONDS);
+        // this future will complete after 20min
+        ScheduledFuture<?> future20 = channel.eventLoop().schedule(runnable, 20, TimeUnit.MINUTES);
+
+        channel.runPendingTasks();
+        assertFalse(future10.isDone());
+        assertFalse(future101.isDone());
+        assertFalse(future20.isDone());
+
+        channel.advanceTimeBy(10, TimeUnit.MINUTES);
+        channel.runPendingTasks();
+        assertTrue(future10.isDone());
+        assertFalse(future101.isDone());
+        assertFalse(future20.isDone());
+
+        channel.unfreezeTime();
+        channel.runPendingTasks();
+        assertTrue(future101.isDone());
+        assertFalse(future20.isDone());
+    }
+
+    @Test
+    void testHasPendingTasks() {
+        EmbeddedChannel channel = new EmbeddedChannel();
+        channel.freezeTime();
+        Runnable runnable = new Runnable() {
+            @Override
+            public void run() {
+            }
+        };
+
+        // simple execute
+        assertFalse(channel.hasPendingTasks());
+        channel.eventLoop().execute(runnable);
+        assertTrue(channel.hasPendingTasks());
+        channel.runPendingTasks();
+        assertFalse(channel.hasPendingTasks());
+
+        // schedule in the future (note: time is frozen above)
+        channel.eventLoop().schedule(runnable, 1, TimeUnit.SECONDS);
+        assertFalse(channel.hasPendingTasks());
+        channel.runPendingTasks();
+        assertFalse(channel.hasPendingTasks());
+        channel.advanceTimeBy(1, TimeUnit.SECONDS);
+        assertTrue(channel.hasPendingTasks());
+        channel.runPendingTasks();
+        assertFalse(channel.hasPendingTasks());
+    }
+
+    @Test
+    void testReentrantClose() {
+        EmbeddedChannel channel = new EmbeddedChannel();
+        channel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+            boolean runningRead;
+
+            @Override
+            public void channelRead(ChannelHandlerContext ctx, Object msg) {
+                runningRead = true;
+                try {
+                    ctx.channel().close();
+                } finally {
+                    runningRead = false;
+                }
+            }
+
+            @Override
+            public void handlerRemoved(ChannelHandlerContext ctx) {
+                if (runningRead) {
+                    throw new IllegalStateException("Reentrant handlerRemoved");
+                }
+            }
+        });
+        channel.writeInbound("foo");
+        channel.checkException();
     }
 
     private static void release(ByteBuf... buffers) {

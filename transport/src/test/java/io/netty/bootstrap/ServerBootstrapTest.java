@@ -16,6 +16,8 @@
 package io.netty.bootstrap;
 
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFactory;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerAdapter;
 import io.netty.channel.ChannelHandlerContext;
@@ -24,6 +26,7 @@ import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.DefaultEventLoopGroup;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.ServerChannel;
 import io.netty.channel.local.LocalAddress;
 import io.netty.channel.local.LocalChannel;
 import io.netty.channel.local.LocalEventLoopGroup;
@@ -31,18 +34,52 @@ import io.netty.channel.local.LocalServerChannel;
 import io.netty.util.AttributeKey;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.function.Executable;
 
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ServerBootstrapTest {
+
+    @Test
+    public void testSetOptionsThrow() {
+        LocalEventLoopGroup group = new LocalEventLoopGroup(1);
+        try {
+            final ChannelFuture cf = new ServerBootstrap()
+                    .group(group)
+                    .channelFactory(new ChannelFactory<ServerChannel>() {
+                        @Override
+                        public ServerChannel newChannel() {
+                            return new TestServerChannel();
+                        }
+                    })
+                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 4242)
+                    .handler(new ChannelInboundHandlerAdapter())
+                    .childHandler(new ChannelInboundHandlerAdapter())
+                    .register();
+
+            assertThrows(UnsupportedOperationException.class, new Executable() {
+                @Override
+                public void execute() throws Throwable {
+                    cf.syncUninterruptibly();
+                }
+            });
+            assertFalse(cf.channel().isActive());
+        } finally {
+            group.shutdownGracefully();
+        }
+    }
 
     @Test
     @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
@@ -179,4 +216,65 @@ public class ServerBootstrapTest {
         group.shutdownGracefully();
         assertTrue(requestServed.get());
     }
+
+    @Test
+    void mustCallInitializerExtensions() throws Exception {
+        LocalAddress addr = new LocalAddress(ServerBootstrapTest.class);
+        final AtomicReference<Channel> expectedServerChannel = new AtomicReference<Channel>();
+        final AtomicReference<Channel> expectedChildChannel = new AtomicReference<Channel>();
+        LocalEventLoopGroup group = new LocalEventLoopGroup(1);
+        final ServerBootstrap sb = new ServerBootstrap();
+        sb.group(group);
+        sb.channel(LocalServerChannel.class);
+        sb.handler(new ChannelInitializer<Channel>() {
+            @Override
+            protected void initChannel(Channel ch) throws Exception {
+                expectedServerChannel.set(ch);
+            }
+        });
+        sb.childHandler(new ChannelInitializer<Channel>() {
+            @Override
+            protected void initChannel(Channel ch) throws Exception {
+                expectedChildChannel.set(ch);
+            }
+        });
+
+        StubChannelInitializerExtension.clearThreadLocals();
+        group.submit(new Runnable() {
+            @Override
+            public void run() {
+                StubChannelInitializerExtension.clearThreadLocals();
+            }
+        }).sync();
+
+        Channel serverChannel = sb.bind(addr).syncUninterruptibly().channel();
+
+        assertNull(StubChannelInitializerExtension.lastSeenClientChannel.get());
+        assertNull(StubChannelInitializerExtension.lastSeenChildChannel.get());
+        assertSame(expectedServerChannel.get(), StubChannelInitializerExtension.lastSeenListenerChannel.get());
+        assertSame(serverChannel, StubChannelInitializerExtension.lastSeenListenerChannel.get());
+
+        Bootstrap cb = new Bootstrap();
+        cb.group(group)
+                .channel(LocalChannel.class)
+                .handler(new ChannelInboundHandlerAdapter());
+        Channel clientChannel = cb.connect(addr).syncUninterruptibly().channel();
+
+        assertSame(clientChannel, StubChannelInitializerExtension.lastSeenClientChannel.get());
+        group.submit(new Callable<Object>() {
+            @Override
+            public Object call() throws Exception {
+                assertSame(expectedChildChannel.get(), StubChannelInitializerExtension.lastSeenChildChannel.get());
+                return null;
+            }
+        }).sync();
+        assertSame(expectedServerChannel.get(), StubChannelInitializerExtension.lastSeenListenerChannel.get());
+        assertSame(serverChannel, StubChannelInitializerExtension.lastSeenListenerChannel.get());
+
+        serverChannel.close().syncUninterruptibly();
+        clientChannel.close().syncUninterruptibly();
+        group.shutdownGracefully();
+    }
+
+    private static final class TestServerChannel extends TestChannel implements ServerChannel { }
 }

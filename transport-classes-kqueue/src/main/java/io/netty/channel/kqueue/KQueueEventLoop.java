@@ -15,6 +15,7 @@
  */
 package io.netty.channel.kqueue;
 
+import io.netty.channel.Channel;
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.EventLoopTaskQueueFactory;
@@ -24,8 +25,8 @@ import io.netty.channel.kqueue.AbstractKQueueChannel.AbstractKQueueUnsafe;
 import io.netty.channel.unix.FileDescriptor;
 import io.netty.channel.unix.IovArray;
 import io.netty.util.IntSupplier;
-import io.netty.util.collection.IntObjectHashMap;
-import io.netty.util.collection.IntObjectMap;
+import io.netty.util.collection.LongObjectHashMap;
+import io.netty.util.collection.LongObjectMap;
 import io.netty.util.concurrent.RejectedExecutionHandler;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
@@ -33,6 +34,9 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
+import java.util.Collection;
+import java.util.Iterator;
 import java.util.Queue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
@@ -47,6 +51,10 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
     private static final AtomicIntegerFieldUpdater<KQueueEventLoop> WAKEN_UP_UPDATER =
             AtomicIntegerFieldUpdater.newUpdater(KQueueEventLoop.class, "wakenUp");
     private static final int KQUEUE_WAKE_UP_IDENT = 0;
+    // `kqueue()` may return EINVAL when a large number such as Integer.MAX_VALUE is specified as timeout.
+    // 24 hours would be a large enough value.
+    // https://man.freebsd.org/cgi/man.cgi?query=kevent&apropos=0&sektion=0&manpath=FreeBSD+6.1-RELEASE&format=html#end
+    private static final int KQUEUE_MAX_TIMEOUT_SECONDS = 86399; // 24 hours - 1 second
 
     static {
         // Ensure JNI is initialized by the time this class is loaded by this time!
@@ -66,8 +74,9 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
             return kqueueWaitNow();
         }
     };
-    private final IntObjectMap<AbstractKQueueChannel> channels = new IntObjectHashMap<AbstractKQueueChannel>(4096);
-
+    private final LongObjectMap<KQueueRegistration> registrations = new LongObjectHashMap<KQueueRegistration>(4096);
+    private final Queue<KQueueRegistration> cancelledRegistrations = new ArrayDeque<KQueueRegistration>();
+    private long nextId;
     private volatile int wakenUp;
     private volatile int ioRatio = 50;
 
@@ -93,6 +102,46 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
         }
     }
 
+    final class KQueueRegistration {
+        private final AbstractKQueueChannel channel;
+        private final long id;
+        private boolean removed;
+
+        KQueueRegistration(AbstractKQueueChannel channel, long id) {
+            this.channel = channel;
+            this.id = id;
+        }
+
+        void evSet(short filter, short flags, int fflags, long data) {
+            assert inEventLoop();
+            if (removed) {
+                return;
+            }
+            changeList.evSet(channel.fd().intValue(), filter, flags, fflags, data, id);
+        }
+
+        void remove() throws Exception {
+            assert inEventLoop();
+
+            KQueueRegistration old = registrations.get(id);
+            if (old == null) {
+                return;
+            }
+            assert old == this;
+            if (!old.removed) {
+                cancelledRegistrations.offer(old);
+            }
+            if (channel.isOpen()) {
+                // Remove the filters. This is only needed if it's still open as otherwise it will be automatically
+                // removed once the file-descriptor is closed.
+                //
+                // See also https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2
+                channel.unregisterFilters();
+            }
+            old.removed = true;
+        }
+    }
+
     private static Queue<Runnable> newTaskQueue(
             EventLoopTaskQueueFactory queueFactory) {
         if (queueFactory == null) {
@@ -101,37 +150,46 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
         return queueFactory.newTaskQueue(DEFAULT_MAX_PENDING_TASKS);
     }
 
-    void add(AbstractKQueueChannel ch) {
-        assert inEventLoop();
-        AbstractKQueueChannel old = channels.put(ch.fd().intValue(), ch);
-        // We either expect to have no Channel in the map with the same FD or that the FD of the old Channel is already
-        // closed.
-        assert old == null || !old.isOpen();
-    }
-
-    void evSet(AbstractKQueueChannel ch, short filter, short flags, int fflags) {
-        assert inEventLoop();
-        changeList.evSet(ch, filter, flags, fflags);
-    }
-
-    void remove(AbstractKQueueChannel ch) throws Exception {
-        assert inEventLoop();
-        int fd = ch.fd().intValue();
-
-        AbstractKQueueChannel old = channels.remove(fd);
-        if (old != null && old != ch) {
-            // The Channel mapping was already replaced due FD reuse, put back the stored Channel.
-            channels.put(fd, old);
-
-            // If we found another Channel in the map that is mapped to the same FD the given Channel MUST be closed.
-            assert !ch.isOpen();
-        } else if (ch.isOpen()) {
-            // Remove the filters. This is only needed if it's still open as otherwise it will be automatically
-            // removed once the file-descriptor is closed.
-            //
-            // See also https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2
-            ch.unregisterFilters();
+    private long generateNextId() {
+        boolean reset = false;
+        for (;;) {
+            if (nextId == Long.MAX_VALUE) {
+                if (reset) {
+                    throw new IllegalStateException("All possible ids in use");
+                }
+                reset = true;
+            }
+            nextId++;
+            if (nextId == KQUEUE_WAKE_UP_IDENT) {
+                continue;
+            }
+            if (!registrations.containsKey(nextId)) {
+                return nextId;
+            }
         }
+    }
+
+    // Process all previous cannceld registrations and remove them from the registration map.Add commentMore actions
+    private void processCancelledRegistrations() {
+        for (;;) {
+            KQueueRegistration cancelledRegistration = cancelledRegistrations.poll();
+            if (cancelledRegistration == null) {
+                return;
+            }
+            KQueueRegistration removed = registrations.remove(cancelledRegistration.id);
+            assert removed == cancelledRegistration;
+        }
+    }
+
+    KQueueRegistration add(AbstractKQueueChannel ch) {
+        assert inEventLoop();
+
+        long id = generateNextId();
+        KQueueRegistration registration = new KQueueRegistration(ch, id);
+        KQueueRegistration old = registrations.put(id, registration);
+
+        assert old == null;
+        return registration;
     }
 
     /**
@@ -165,8 +223,9 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
         }
 
         long totalDelay = delayNanos(System.nanoTime());
-        int delaySeconds = (int) min(totalDelay / 1000000000L, Integer.MAX_VALUE);
-        return kqueueWait(delaySeconds, (int) min(totalDelay - delaySeconds * 1000000000L, Integer.MAX_VALUE));
+        int delaySeconds = (int) min(totalDelay / 1000000000L, KQUEUE_MAX_TIMEOUT_SECONDS);
+        int delayNanos = (int) (totalDelay % 1000000000L);
+        return kqueueWait(delaySeconds, delayNanos);
     }
 
     private int kqueueWaitNow() throws IOException {
@@ -192,16 +251,20 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
                 continue;
             }
 
-            AbstractKQueueChannel channel = channels.get(fd);
-            if (channel == null) {
+            long id = eventList.udata(i);
+            KQueueRegistration registration = registrations.get(id);
+            if (registration == null) {
                 // This may happen if the channel has already been closed, and it will be removed from kqueue anyways.
                 // We also handle EV_ERROR above to skip this even early if it is a result of a referencing a closed and
                 // thus removed from kqueue FD.
-                logger.warn("events[{}]=[{}, {}] had no channel!", i, eventList.fd(i), filter);
+                logger.warn("events[{}]=[{}, {}, {}] had no registration!", i, fd, id, filter);
                 continue;
             }
-
-            AbstractKQueueUnsafe unsafe = (AbstractKQueueUnsafe) channel.unsafe();
+            if (registration.removed) {
+                // just ignore
+                continue;
+            }
+            AbstractKQueueUnsafe unsafe = (AbstractKQueueUnsafe) registration.channel.unsafe();
             // First check for EPOLLOUT as we may need to fail the connect ChannelPromise before try
             // to read from the file descriptor.
             if (filter == Native.EVFILT_WRITE) {
@@ -302,6 +365,7 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
             } catch (Throwable t) {
                 handleLoopException(t);
             } finally {
+                processCancelledRegistrations();
                 // Always handle shutdown even if the loop processing threw an exception.
                 try {
                     if (isShuttingDown()) {
@@ -350,7 +414,34 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
 
     @Override
     public int registeredChannels() {
-        return channels.size();
+        return registrations.size();
+    }
+
+    @Override
+    public Iterator<Channel> registeredChannelsIterator() {
+        assert inEventLoop();
+        final LongObjectMap<KQueueRegistration> ch = registrations;
+        if (ch.isEmpty()) {
+            return ChannelsReadOnlyIterator.empty();
+        }
+        return new ChannelsReadOnlyIterator<AbstractKQueueChannel>(new Iterable<AbstractKQueueChannel>() {
+            private final Collection<KQueueRegistration> registrations = ch.values();
+            @Override
+            public Iterator<AbstractKQueueChannel> iterator() {
+                final Iterator<KQueueRegistration> registrationIterator = registrations.iterator();
+                return new Iterator<AbstractKQueueChannel>() {
+                    @Override
+                    public boolean hasNext() {
+                        return registrationIterator.hasNext();
+                    }
+
+                    @Override
+                    public AbstractKQueueChannel next() {
+                        return registrationIterator.next().channel;
+                    }
+                };
+            }
+        });
     }
 
     @Override
@@ -363,6 +454,7 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
             }
         } finally {
             // Cleanup all native memory!
+            iovArray.release();
             changeList.free();
             eventList.free();
         }
@@ -377,11 +469,12 @@ final class KQueueEventLoop extends SingleThreadEventLoop {
 
         // Using the intermediate collection to prevent ConcurrentModificationException.
         // In the `close()` method, the channel is deleted from `channels` map.
-        AbstractKQueueChannel[] localChannels = channels.values().toArray(new AbstractKQueueChannel[0]);
+        KQueueRegistration[] localRegistrations = registrations.values().toArray(new KQueueRegistration[0]);
 
-        for (AbstractKQueueChannel ch: localChannels) {
-            ch.unsafe().close(ch.unsafe().voidPromise());
+        for (KQueueRegistration reg: localRegistrations) {
+            reg.channel.unsafe().close(reg.channel.unsafe().voidPromise());
         }
+        processCancelledRegistrations();
     }
 
     private static void handleLoopException(Throwable t) {

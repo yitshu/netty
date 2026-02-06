@@ -154,7 +154,7 @@ public class ByteBufInputStream extends InputStream implements DataInput {
 
     // Suppress a warning since the class is not thread-safe
     @Override
-    public void mark(int readlimit) {   // lgtm[java/non-sync-override]
+    public void mark(int readlimit) {
         buffer.markReaderIndex();
     }
 
@@ -186,7 +186,7 @@ public class ByteBufInputStream extends InputStream implements DataInput {
 
     // Suppress a warning since the class is not thread-safe
     @Override
-    public void reset() throws IOException {    // lgtm[java/non-sync-override]
+    public void reset() throws IOException {
         buffer.resetReaderIndex();
     }
 
@@ -207,10 +207,7 @@ public class ByteBufInputStream extends InputStream implements DataInput {
 
     @Override
     public byte readByte() throws IOException {
-        int available = available();
-        if (available == 0) {
-            throw new EOFException();
-        }
+        checkAvailable(1);
         return buffer.readByte();
     }
 

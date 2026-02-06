@@ -15,6 +15,7 @@
  */
 package io.netty.channel.local;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.AbstractChannel;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelConfig;
@@ -74,6 +75,13 @@ public class LocalChannel extends AbstractChannel {
         @Override
         public void run() {
             unsafe().close(unsafe().voidPromise());
+        }
+    };
+
+    private final Runnable finishReadTask = new Runnable() {
+        @Override
+        public void run() {
+            finishPeerRead0(LocalChannel.this);
         }
     };
 
@@ -296,9 +304,32 @@ public class LocalChannel extends AbstractChannel {
             if (received == null) {
                 break;
             }
+            if (received instanceof ByteBuf && inboundBuffer.peek() instanceof ByteBuf) {
+                ByteBuf msg = (ByteBuf) received;
+                ByteBuf output = handle.allocate(alloc());
+                if (msg.readableBytes() < output.writableBytes()) {
+                    // We have an opportunity to coalesce buffers.
+                    output.writeBytes(msg, msg.readerIndex(), msg.readableBytes());
+                    msg.release();
+                    while ((received = inboundBuffer.peek()) instanceof ByteBuf &&
+                            ((ByteBuf) received).readableBytes() < output.writableBytes()) {
+                        inboundBuffer.poll();
+                        msg = (ByteBuf) received;
+                        output.writeBytes(msg, msg.readerIndex(), msg.readableBytes());
+                        msg.release();
+                    }
+                    handle.lastBytesRead(output.readableBytes());
+                    received = output; // Send the coalesced buffer down the pipeline.
+                } else {
+                    // It won't be profitable to coalesce buffers this time around.
+                    handle.lastBytesRead(output.capacity());
+                    output.release();
+                }
+            }
+            handle.incMessagesRead(1);
             pipeline.fireChannelRead(received);
         } while (handle.continueReading());
-
+        handle.readComplete();
         pipeline.fireChannelReadComplete();
     }
 
@@ -315,7 +346,7 @@ public class LocalChannel extends AbstractChannel {
         }
 
         final InternalThreadLocalMap threadLocals = InternalThreadLocalMap.get();
-        final Integer stackDepth = threadLocals.localChannelReaderStackDepth();
+        final int stackDepth = threadLocals.localChannelReaderStackDepth();
         if (stackDepth < MAX_READER_STACK_DEPTH) {
             threadLocals.setLocalChannelReaderStackDepth(stackDepth + 1);
             try {
@@ -394,21 +425,19 @@ public class LocalChannel extends AbstractChannel {
         }
     }
 
-    private void runFinishPeerReadTask(final LocalChannel peer) {
+    private void runFinishTask0() {
         // If the peer is writing, we must wait until after reads are completed for that peer before we can read. So
         // we keep track of the task, and coordinate later that our read can't happen until the peer is done.
-        final Runnable finishPeerReadTask = new Runnable() {
-            @Override
-            public void run() {
-                finishPeerRead0(peer);
-            }
-        };
+        if (writeInProgress) {
+            finishReadFuture = eventLoop().submit(finishReadTask);
+        } else {
+            eventLoop().execute(finishReadTask);
+        }
+    }
+
+    private void runFinishPeerReadTask(final LocalChannel peer) {
         try {
-            if (peer.writeInProgress) {
-                peer.finishReadFuture = peer.eventLoop().submit(finishPeerReadTask);
-            } else {
-                peer.eventLoop().execute(finishPeerReadTask);
-            }
+            peer.runFinishTask0();
         } catch (Throwable cause) {
             logger.warn("Closing Local channels {}-{} because exception occurred!", this, peer, cause);
             close();
@@ -458,7 +487,6 @@ public class LocalChannel extends AbstractChannel {
             if (state == State.CONNECTED) {
                 Exception cause = new AlreadyConnectedException();
                 safeSetFailure(promise, cause);
-                pipeline().fireExceptionCaught(cause);
                 return;
             }
 

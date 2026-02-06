@@ -188,7 +188,7 @@ final class NativeDatagramPacketArray {
             this.segmentSize = segmentSize;
 
             this.senderScopeId = 0;
-            this.senderPort = 0;
+            this.senderPort = -1;
             this.senderAddrLen = 0;
 
             if (recipient == null) {
@@ -209,17 +209,24 @@ final class NativeDatagramPacketArray {
             }
         }
 
+        boolean hasSender() {
+            return senderPort >= 0;
+        }
+
         DatagramPacket newDatagramPacket(ByteBuf buffer, InetSocketAddress recipient) throws UnknownHostException {
             InetSocketAddress sender = newAddress(senderAddr, senderAddrLen, senderPort, senderScopeId, ipv4Bytes);
             if (recipientAddrLen != 0) {
                 recipient = newAddress(recipientAddr, recipientAddrLen, recipientPort, recipientScopeId, ipv4Bytes);
             }
 
+            // Slice out the buffer with the correct length.
+            ByteBuf slice = buffer.retainedSlice(buffer.readerIndex(), count);
+
             // UDP_GRO
             if (segmentSize > 0) {
-                return new SegmentedDatagramPacket(buffer, segmentSize, recipient, sender);
+                return new SegmentedDatagramPacket(slice, segmentSize, recipient, sender);
             }
-            return new DatagramPacket(buffer, recipient, sender);
+            return new DatagramPacket(slice, recipient, sender);
         }
     }
 }

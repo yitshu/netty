@@ -23,6 +23,7 @@ import io.netty.example.factorial.FactorialServerHandler;
 import io.netty.example.factorial.NumberEncoder;
 import io.netty.example.http.snoop.HttpSnoopServerHandler;
 import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.codec.compression.CompressionOptions;
 import io.netty.handler.codec.compression.ZlibCodecFactory;
 import io.netty.handler.codec.compression.ZlibWrapper;
 import io.netty.handler.codec.http.HttpContentCompressor;
@@ -38,6 +39,8 @@ import java.util.List;
  * SSL or GZIP.
  */
 public class PortUnificationServerHandler extends ByteToMessageDecoder {
+
+    private static final int MAX_CONTENT_LENGTH = 65536;
 
     private final SslContext sslCtx;
     private final boolean detectSsl;
@@ -81,7 +84,7 @@ public class PortUnificationServerHandler extends ByteToMessageDecoder {
 
     private boolean isSsl(ByteBuf buf) {
         if (detectSsl) {
-            return SslHandler.isEncrypted(buf);
+            return SslHandler.isEncrypted(buf, false);
         }
         return false;
     }
@@ -120,7 +123,7 @@ public class PortUnificationServerHandler extends ByteToMessageDecoder {
     private void enableGzip(ChannelHandlerContext ctx) {
         ChannelPipeline p = ctx.pipeline();
         p.addLast("gzipdeflater", ZlibCodecFactory.newZlibEncoder(ZlibWrapper.GZIP));
-        p.addLast("gzipinflater", ZlibCodecFactory.newZlibDecoder(ZlibWrapper.GZIP));
+        p.addLast("gzipinflater", ZlibCodecFactory.newZlibDecoder(ZlibWrapper.GZIP, MAX_CONTENT_LENGTH));
         p.addLast("unificationB", new PortUnificationServerHandler(sslCtx, detectSsl, false));
         p.remove(this);
     }
@@ -129,7 +132,7 @@ public class PortUnificationServerHandler extends ByteToMessageDecoder {
         ChannelPipeline p = ctx.pipeline();
         p.addLast("decoder", new HttpRequestDecoder());
         p.addLast("encoder", new HttpResponseEncoder());
-        p.addLast("deflater", new HttpContentCompressor());
+        p.addLast("deflater", new HttpContentCompressor((CompressionOptions[]) null));
         p.addLast("handler", new HttpSnoopServerHandler());
         p.remove(this);
     }

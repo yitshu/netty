@@ -33,7 +33,6 @@ import io.netty.channel.unix.UnixChannelUtil;
 import io.netty.util.CharsetUtil;
 import io.netty.util.UncheckedBooleanSupplier;
 import io.netty.util.internal.StringUtil;
-import io.netty.util.internal.UnstableApi;
 
 import java.io.IOException;
 import java.net.SocketAddress;
@@ -41,10 +40,9 @@ import java.nio.ByteBuffer;
 
 import static io.netty.channel.epoll.LinuxSocket.newSocketDomainDgram;
 
-@UnstableApi
 public final class EpollDomainDatagramChannel extends AbstractEpollChannel implements DomainDatagramChannel {
 
-    private static final ChannelMetadata METADATA = new ChannelMetadata(true);
+    private static final ChannelMetadata METADATA = new ChannelMetadata(true, 16);
 
     private static final String EXPECTED_TYPES =
             " (expected: " +
@@ -177,7 +175,7 @@ public final class EpollDomainDatagramChannel extends AbstractEpollChannel imple
         if (data.hasMemoryAddress()) {
             long memoryAddress = data.memoryAddress();
             if (remoteAddress == null) {
-                writtenBytes = socket.writeAddress(memoryAddress, data.readerIndex(), data.writerIndex());
+                writtenBytes = socket.sendAddress(memoryAddress, data.readerIndex(), data.writerIndex());
             } else {
                 writtenBytes = socket.sendToAddressDomainSocket(memoryAddress, data.readerIndex(), data.writerIndex(),
                         remoteAddress.path().getBytes(CharsetUtil.UTF_8));
@@ -197,7 +195,7 @@ public final class EpollDomainDatagramChannel extends AbstractEpollChannel imple
         } else {
             ByteBuffer nioData = data.internalNioBuffer(data.readerIndex(), data.readableBytes());
             if (remoteAddress == null) {
-                writtenBytes = socket.write(nioData, nioData.position(), nioData.limit());
+                writtenBytes = socket.send(nioData, nioData.position(), nioData.limit());
             } else {
                 writtenBytes = socket.sendToDomainSocket(nioData, nioData.position(), nioData.limit(),
                         remoteAddress.path().getBytes(CharsetUtil.UTF_8));

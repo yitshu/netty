@@ -32,11 +32,13 @@ import io.netty.util.concurrent.GlobalEventExecutor;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.SocketUtils;
 import io.netty.util.internal.StringUtil;
+import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -51,6 +53,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * transports such as datagram (UDP).</p>
  */
 public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C extends Channel> implements Cloneable {
+
+    private static final boolean CLOSE_ON_SET_OPTION_FAILURE = SystemPropertyUtil.getBoolean(
+            "io.netty.bootstrap.closeOnSetOptionFailure", true);
     @SuppressWarnings("unchecked")
     private static final Map.Entry<ChannelOption<?>, Object>[] EMPTY_OPTION_ARRAY = new Map.Entry[0];
     @SuppressWarnings("unchecked")
@@ -66,6 +71,7 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     private final Map<ChannelOption<?>, Object> options = new LinkedHashMap<ChannelOption<?>, Object>();
     private final Map<AttributeKey<?>, Object> attrs = new ConcurrentHashMap<AttributeKey<?>, Object>();
     private volatile ChannelHandler handler;
+    private volatile ClassLoader extensionsClassLoader;
 
     AbstractBootstrap() {
         // Disallow extending from a different package.
@@ -80,6 +86,7 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
             options.putAll(bootstrap.options);
         }
         attrs.putAll(bootstrap.attrs);
+        extensionsClassLoader = bootstrap.extensionsClassLoader;
     }
 
     /**
@@ -193,6 +200,19 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
         } else {
             attrs.put(key, value);
         }
+        return self();
+    }
+
+    /**
+     * Load {@link ChannelInitializerExtension}s using the given class loader.
+     * <p>
+     * By default, the extensions will be loaded by the same class loader that loaded this bootstrap class.
+     *
+     * @param classLoader The class loader to use for loading {@link ChannelInitializerExtension}s.
+     * @return This bootstrap.
+     */
+    public B extensionsClassLoader(ClassLoader classLoader) {
+        extensionsClassLoader = classLoader;
         return self();
     }
 
@@ -341,7 +361,15 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
         return regFuture;
     }
 
-    abstract void init(Channel channel) throws Exception;
+    abstract void init(Channel channel) throws Throwable;
+
+    Collection<ChannelInitializerExtension> getInitializerExtensions() {
+        ClassLoader loader = extensionsClassLoader;
+        if (loader == null) {
+            loader = getClass().getClassLoader();
+        }
+        return ChannelInitializerExtensions.getExtensions().extensions(loader);
+    }
 
     private static void doBind0(
             final ChannelFuture regFuture, final Channel channel,
@@ -450,7 +478,7 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 
     static void setChannelOptions(
-            Channel channel, Map.Entry<ChannelOption<?>, Object>[] options, InternalLogger logger) {
+            Channel channel, Map.Entry<ChannelOption<?>, Object>[] options, InternalLogger logger) throws Throwable {
         for (Map.Entry<ChannelOption<?>, Object> e: options) {
             setChannelOption(channel, e.getKey(), e.getValue(), logger);
         }
@@ -458,14 +486,20 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
 
     @SuppressWarnings("unchecked")
     private static void setChannelOption(
-            Channel channel, ChannelOption<?> option, Object value, InternalLogger logger) {
+            Channel channel, ChannelOption<?> option, Object value, InternalLogger logger) throws Throwable {
         try {
             if (!channel.config().setOption((ChannelOption<Object>) option, value)) {
-                logger.warn("Unknown channel option '{}' for channel '{}'", option, channel);
+                logger.warn("Unknown channel option '{}' for channel '{}' of type '{}'",
+                        option, channel, channel.getClass());
             }
         } catch (Throwable t) {
             logger.warn(
-                    "Failed to set channel option '{}' with value '{}' for channel '{}'", option, value, channel, t);
+                    "Failed to set channel option '{}' with value '{}' for channel '{}' of type '{}'",
+                    option, value, channel, channel.getClass(), t);
+            if (CLOSE_ON_SET_OPTION_FAILURE) {
+                // Only rethrow if we want to close the channel in case of a failure.
+                throw t;
+            }
         }
     }
 

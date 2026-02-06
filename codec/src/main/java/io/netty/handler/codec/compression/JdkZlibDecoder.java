@@ -57,6 +57,7 @@ public class JdkZlibDecoder extends ZlibDecoder {
     private GzipState gzipState = GzipState.HEADER_START;
     private int flags = -1;
     private int xlen = -1;
+    private boolean needsRead;
 
     private volatile boolean finished;
 
@@ -64,7 +65,10 @@ public class JdkZlibDecoder extends ZlibDecoder {
 
     /**
      * Creates a new instance with the default wrapper ({@link ZlibWrapper#ZLIB}).
+     *
+     * @deprecated Use {@link JdkZlibDecoder#JdkZlibDecoder(int)}.
      */
+    @Deprecated
     public JdkZlibDecoder() {
         this(ZlibWrapper.ZLIB, null, false, 0);
     }
@@ -85,7 +89,10 @@ public class JdkZlibDecoder extends ZlibDecoder {
      * Creates a new instance with the specified preset dictionary. The wrapper
      * is always {@link ZlibWrapper#ZLIB} because it is the only format that
      * supports the preset dictionary.
+     *
+     * @deprecated Use {@link JdkZlibDecoder#JdkZlibDecoder(byte[], int)}.
      */
+    @Deprecated
     public JdkZlibDecoder(byte[] dictionary) {
         this(ZlibWrapper.ZLIB, dictionary, false, 0);
     }
@@ -107,7 +114,10 @@ public class JdkZlibDecoder extends ZlibDecoder {
      * Creates a new instance with the specified wrapper.
      * Be aware that only {@link ZlibWrapper#GZIP}, {@link ZlibWrapper#ZLIB} and {@link ZlibWrapper#NONE} are
      * supported atm.
+     *
+     * @deprecated Use {@link JdkZlibDecoder#JdkZlibDecoder(ZlibWrapper, int)}.
      */
+    @Deprecated
     public JdkZlibDecoder(ZlibWrapper wrapper) {
         this(wrapper, null, false, 0);
     }
@@ -125,6 +135,10 @@ public class JdkZlibDecoder extends ZlibDecoder {
         this(wrapper, null, false, maxAllocation);
     }
 
+    /**
+     * @deprecated Use {@link JdkZlibDecoder#JdkZlibDecoder(ZlibWrapper, boolean, int)}.
+     */
+    @Deprecated
     public JdkZlibDecoder(ZlibWrapper wrapper, boolean decompressConcatenated) {
         this(wrapper, null, decompressConcatenated, 0);
     }
@@ -133,6 +147,10 @@ public class JdkZlibDecoder extends ZlibDecoder {
         this(wrapper, null, decompressConcatenated, maxAllocation);
     }
 
+    /**
+     * @deprecated Use {@link JdkZlibDecoder#JdkZlibDecoder(boolean, int)}.
+     */
+    @Deprecated
     public JdkZlibDecoder(boolean decompressConcatenated) {
         this(ZlibWrapper.GZIP, null, decompressConcatenated, 0);
     }
@@ -178,6 +196,7 @@ public class JdkZlibDecoder extends ZlibDecoder {
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+        needsRead = true;
         if (finished) {
             // Skip data received after finished.
             in.skipBytes(in.readableBytes());
@@ -246,7 +265,15 @@ public class JdkZlibDecoder extends ZlibDecoder {
                     if (crc != null) {
                         crc.update(outArray, outIndex, outputLength);
                     }
-                } else  if (inflater.needsDictionary()) {
+                    if (maxAllocation == 0) {
+                        // If we don't limit the maximum allocations we should just
+                        // forward the buffer directly.
+                        ByteBuf buffer = decompressed;
+                        decompressed = null;
+                        needsRead = false;
+                        ctx.fireChannelRead(buffer);
+                    }
+                } else if (inflater.needsDictionary()) {
                     if (dictionary == null) {
                         throw new DecompressionException(
                                 "decompression failure, unable to set dictionary as non was specified");
@@ -275,10 +302,13 @@ public class JdkZlibDecoder extends ZlibDecoder {
         } catch (DataFormatException e) {
             throw new DecompressionException("decompression failure", e);
         } finally {
-            if (decompressed.isReadable()) {
-                out.add(decompressed);
-            } else {
-                decompressed.release();
+            if (decompressed != null) {
+                if (decompressed.isReadable()) {
+                    needsRead = false;
+                    ctx.fireChannelRead(decompressed);
+                } else {
+                    decompressed.release();
+                }
             }
         }
     }
@@ -507,5 +537,16 @@ public class JdkZlibDecoder extends ZlibDecoder {
     private static boolean looksLikeZlib(short cmf_flg) {
         return (cmf_flg & 0x7800) == 0x7800 &&
                 cmf_flg % 31 == 0;
+    }
+
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        // Discard bytes of the cumulation buffer if needed.
+        discardSomeReadBytes();
+
+        if (needsRead && !ctx.channel().config().isAutoRead()) {
+            ctx.read();
+        }
+        ctx.fireChannelReadComplete();
     }
 }

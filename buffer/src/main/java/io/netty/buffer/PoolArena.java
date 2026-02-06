@@ -25,12 +25,14 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static io.netty.buffer.PoolChunk.isSubpage;
 import static java.lang.Math.max;
 
-abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
-    static final boolean HAS_UNSAFE = PlatformDependent.hasUnsafe();
+abstract class PoolArena<T> implements PoolArenaMetric {
+    private static final boolean HAS_UNSAFE = PlatformDependent.hasUnsafe();
 
     enum SizeClass {
         Small,
@@ -39,9 +41,7 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
 
     final PooledByteBufAllocator parent;
 
-    final int numSmallSubpagePools;
-    final int directMemoryCacheAlignment;
-    private final PoolSubpage<T>[] smallSubpagePools;
+    final PoolSubpage<T>[] smallSubpagePools;
 
     private final PoolChunkList<T> q050;
     private final PoolChunkList<T> q025;
@@ -71,24 +71,25 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     // TODO: Test if adding padding helps under contention
     //private long pad0, pad1, pad2, pad3, pad4, pad5, pad6, pad7;
 
-    protected PoolArena(PooledByteBufAllocator parent, int pageSize,
-          int pageShifts, int chunkSize, int cacheAlignment) {
-        super(pageSize, pageShifts, chunkSize, cacheAlignment);
-        this.parent = parent;
-        directMemoryCacheAlignment = cacheAlignment;
+    private final ReentrantLock lock = new ReentrantLock();
 
-        numSmallSubpagePools = nSubpages;
-        smallSubpagePools = newSubpagePoolArray(numSmallSubpagePools);
+    final SizeClasses sizeClass;
+
+    protected PoolArena(PooledByteBufAllocator parent, SizeClasses sizeClass) {
+        assert null != sizeClass;
+        this.parent = parent;
+        this.sizeClass = sizeClass;
+        smallSubpagePools = newSubpagePoolArray(sizeClass.nSubpages);
         for (int i = 0; i < smallSubpagePools.length; i ++) {
-            smallSubpagePools[i] = newSubpagePoolHead();
+            smallSubpagePools[i] = newSubpagePoolHead(i);
         }
 
-        q100 = new PoolChunkList<T>(this, null, 100, Integer.MAX_VALUE, chunkSize);
-        q075 = new PoolChunkList<T>(this, q100, 75, 100, chunkSize);
-        q050 = new PoolChunkList<T>(this, q075, 50, 100, chunkSize);
-        q025 = new PoolChunkList<T>(this, q050, 25, 75, chunkSize);
-        q000 = new PoolChunkList<T>(this, q025, 1, 50, chunkSize);
-        qInit = new PoolChunkList<T>(this, q000, Integer.MIN_VALUE, 25, chunkSize);
+        q100 = new PoolChunkList<T>(this, null, 100, Integer.MAX_VALUE, sizeClass.chunkSize);
+        q075 = new PoolChunkList<T>(this, q100, 75, 100, sizeClass.chunkSize);
+        q050 = new PoolChunkList<T>(this, q100, 50, 100, sizeClass.chunkSize);
+        q025 = new PoolChunkList<T>(this, q050, 25, 75, sizeClass.chunkSize);
+        q000 = new PoolChunkList<T>(this, q025, 1, 50, sizeClass.chunkSize);
+        qInit = new PoolChunkList<T>(this, q000, Integer.MIN_VALUE, 25, sizeClass.chunkSize);
 
         q100.prevList(q075);
         q075.prevList(q050);
@@ -107,8 +108,8 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
         chunkListMetrics = Collections.unmodifiableList(metrics);
     }
 
-    private PoolSubpage<T> newSubpagePoolHead() {
-        PoolSubpage<T> head = new PoolSubpage<T>();
+    private PoolSubpage<T> newSubpagePoolHead(int index) {
+        PoolSubpage<T> head = new PoolSubpage<T>(index);
         head.prev = head;
         head.next = head;
         return head;
@@ -128,15 +129,15 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     }
 
     private void allocate(PoolThreadCache cache, PooledByteBuf<T> buf, final int reqCapacity) {
-        final int sizeIdx = size2SizeIdx(reqCapacity);
+        final int sizeIdx = sizeClass.size2SizeIdx(reqCapacity);
 
-        if (sizeIdx <= smallMaxSizeIdx) {
+        if (sizeIdx <= sizeClass.smallMaxSizeIdx) {
             tcacheAllocateSmall(cache, buf, reqCapacity, sizeIdx);
-        } else if (sizeIdx < nSizes) {
+        } else if (sizeIdx < sizeClass.nSizes) {
             tcacheAllocateNormal(cache, buf, reqCapacity, sizeIdx);
         } else {
-            int normCapacity = directMemoryCacheAlignment > 0
-                    ? normalizeSize(reqCapacity) : reqCapacity;
+            int normCapacity = sizeClass.directMemoryCacheAlignment > 0
+                    ? sizeClass.normalizeSize(reqCapacity) : reqCapacity;
             // Huge allocations are never served via the cache so just call allocateHuge
             allocateHuge(buf, normCapacity);
         }
@@ -156,21 +157,27 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
          */
         final PoolSubpage<T> head = smallSubpagePools[sizeIdx];
         final boolean needsNormalAllocation;
-        synchronized (head) {
+        head.lock();
+        try {
             final PoolSubpage<T> s = head.next;
             needsNormalAllocation = s == head;
             if (!needsNormalAllocation) {
-                assert s.doNotDestroy && s.elemSize == sizeIdx2size(sizeIdx) : "doNotDestroy=" +
+                assert s.doNotDestroy && s.elemSize == sizeClass.sizeIdx2size(sizeIdx) : "doNotDestroy=" +
                         s.doNotDestroy + ", elemSize=" + s.elemSize + ", sizeIdx=" + sizeIdx;
                 long handle = s.allocate();
                 assert handle >= 0;
                 s.chunk.initBufWithSubpage(buf, null, handle, reqCapacity, cache);
             }
+        } finally {
+            head.unlock();
         }
 
         if (needsNormalAllocation) {
-            synchronized (this) {
+            lock();
+            try {
                 allocateNormal(buf, reqCapacity, sizeIdx, cache);
+            } finally {
+                unlock();
             }
         }
 
@@ -183,14 +190,17 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
             // was able to allocate out of the cache so move on
             return;
         }
-        synchronized (this) {
+        lock();
+        try {
             allocateNormal(buf, reqCapacity, sizeIdx, cache);
             ++allocationsNormal;
+        } finally {
+            unlock();
         }
     }
 
-    // Method must be called inside synchronized(this) { ... } block
     private void allocateNormal(PooledByteBuf<T> buf, int reqCapacity, int sizeIdx, PoolThreadCache threadCache) {
+        assert lock.isHeldByCurrentThread();
         if (q050.allocate(buf, reqCapacity, sizeIdx, threadCache) ||
             q025.allocate(buf, reqCapacity, sizeIdx, threadCache) ||
             q000.allocate(buf, reqCapacity, sizeIdx, threadCache) ||
@@ -200,7 +210,7 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
         }
 
         // Add a new chunk.
-        PoolChunk<T> c = newChunk(pageSize, nPSizes, pageShifts, chunkSize);
+        PoolChunk<T> c = newChunk(sizeClass.pageSize, sizeClass.nPSizes, sizeClass.pageShifts, sizeClass.chunkSize);
         boolean success = c.allocate(buf, reqCapacity, sizeIdx, threadCache);
         assert success;
         qInit.add(c);
@@ -218,6 +228,7 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     }
 
     void free(PoolChunk<T> chunk, ByteBuffer nioBuffer, long handle, int normCapacity, PoolThreadCache cache) {
+        chunk.decrementPinnedMemory(normCapacity);
         if (chunk.unpooled) {
             int size = chunk.chunkSize();
             destroyChunk(chunk);
@@ -241,7 +252,8 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     void freeChunk(PoolChunk<T> chunk, long handle, int normCapacity, SizeClass sizeClass, ByteBuffer nioBuffer,
                    boolean finalizer) {
         final boolean destroyChunk;
-        synchronized (this) {
+        lock();
+        try {
             // We only call this if freeChunk is not called because of the PoolThreadCache finalizer as otherwise this
             // may fail due lazy class-loading in for example tomcat.
             if (!finalizer) {
@@ -257,6 +269,8 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
                 }
             }
             destroyChunk = !chunk.parent.free(chunk, handle, normCapacity, nioBuffer);
+        } finally {
+            unlock();
         }
         if (destroyChunk) {
             // destroyChunk not need to be called while holding the synchronized lock.
@@ -264,27 +278,44 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
         }
     }
 
-    PoolSubpage<T> findSubpagePoolHead(int sizeIdx) {
-        return smallSubpagePools[sizeIdx];
-    }
-
-    void reallocate(PooledByteBuf<T> buf, int newCapacity, boolean freeOldMemory) {
+    void reallocate(PooledByteBuf<T> buf, int newCapacity) {
         assert newCapacity >= 0 && newCapacity <= buf.maxCapacity();
 
-        int oldCapacity = buf.length;
-        if (oldCapacity == newCapacity) {
-            return;
+        final int oldCapacity;
+        final PoolChunk<T> oldChunk;
+        final ByteBuffer oldNioBuffer;
+        final long oldHandle;
+        final T oldMemory;
+        final int oldOffset;
+        final int oldMaxLength;
+        final PoolThreadCache oldCache;
+
+        // We synchronize on the ByteBuf itself to ensure there is no "concurrent" reallocations for the same buffer.
+        // We do this to ensure the ByteBuf internal fields that are used to allocate / free are not accessed
+        // concurrently. This is important as otherwise we might end up corrupting our internal state of our data
+        // structures.
+        //
+        // Also note we don't use a Lock here but just synchronized even tho this might seem like a bad choice for Loom.
+        // This is done to minimize the overhead per ByteBuf. The time this would block another thread should be
+        // relative small and so not be a problem for Loom.
+        // See https://github.com/netty/netty/issues/13467
+        synchronized (buf) {
+            oldCapacity = buf.length;
+            if (oldCapacity == newCapacity) {
+                return;
+            }
+
+            oldChunk = buf.chunk;
+            oldNioBuffer = buf.tmpNioBuf;
+            oldHandle = buf.handle;
+            oldMemory = buf.memory;
+            oldOffset = buf.offset;
+            oldMaxLength = buf.maxLength;
+            oldCache = buf.cache;
+
+            // This does not touch buf's reader/writer indices
+            allocate(parent.threadCache(), buf, newCapacity);
         }
-
-        PoolChunk<T> oldChunk = buf.chunk;
-        ByteBuffer oldNioBuffer = buf.tmpNioBuf;
-        long oldHandle = buf.handle;
-        T oldMemory = buf.memory;
-        int oldOffset = buf.offset;
-        int oldMaxLength = buf.maxLength;
-
-        // This does not touch buf's reader/writer indices
-        allocate(parent.threadCache(), buf, newCapacity);
         int bytesToCopy;
         if (newCapacity > oldCapacity) {
             bytesToCopy = oldCapacity;
@@ -293,9 +324,7 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
             bytesToCopy = newCapacity;
         }
         memoryCopy(oldMemory, oldOffset, buf, bytesToCopy);
-        if (freeOldMemory) {
-            free(oldChunk, oldNioBuffer, oldHandle, oldMaxLength, buf.cache);
-        }
+        free(oldChunk, oldNioBuffer, oldHandle, oldMaxLength, oldCache);
     }
 
     @Override
@@ -354,8 +383,11 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     @Override
     public long numAllocations() {
         final long allocsNormal;
-        synchronized (this) {
+        lock();
+        try {
             allocsNormal = allocationsNormal;
+        } finally {
+            unlock();
         }
         return allocationsSmall.value() + allocsNormal + allocationsHuge.value();
     }
@@ -371,15 +403,23 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     }
 
     @Override
-    public synchronized long numNormalAllocations() {
-        return allocationsNormal;
+    public long numNormalAllocations() {
+        lock();
+        try {
+            return allocationsNormal;
+        } finally {
+            unlock();
+        }
     }
 
     @Override
     public long numDeallocations() {
         final long deallocs;
-        synchronized (this) {
+        lock();
+        try {
             deallocs = deallocationsSmall + deallocationsNormal;
+        } finally {
+            unlock();
         }
         return deallocs + deallocationsHuge.value();
     }
@@ -390,13 +430,23 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     }
 
     @Override
-    public synchronized long numSmallDeallocations() {
-        return deallocationsSmall;
+    public long numSmallDeallocations() {
+        lock();
+        try {
+            return deallocationsSmall;
+        } finally {
+            unlock();
+        }
     }
 
     @Override
-    public synchronized long numNormalDeallocations() {
-        return deallocationsNormal;
+    public long numNormalDeallocations() {
+        lock();
+        try {
+            return deallocationsNormal;
+        } finally {
+            unlock();
+        }
     }
 
     @Override
@@ -413,8 +463,11 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     public  long numActiveAllocations() {
         long val = allocationsSmall.value() + allocationsHuge.value()
                 - deallocationsHuge.value();
-        synchronized (this) {
+        lock();
+        try {
             val += allocationsNormal - (deallocationsSmall + deallocationsNormal);
+        } finally {
+            unlock();
         }
         return max(val, 0);
     }
@@ -432,8 +485,11 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     @Override
     public long numActiveNormalAllocations() {
         final long val;
-        synchronized (this) {
+        lock();
+        try {
             val = allocationsNormal - deallocationsNormal;
+        } finally {
+            unlock();
         }
         return max(val, 0);
     }
@@ -446,27 +502,28 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     @Override
     public long numActiveBytes() {
         long val = activeBytesHuge.value();
-        synchronized (this) {
+        lock();
+        try {
             for (int i = 0; i < chunkListMetrics.size(); i++) {
                 for (PoolChunkMetric m: chunkListMetrics.get(i)) {
                     val += m.chunkSize();
                 }
             }
+        } finally {
+            unlock();
         }
         return max(0, val);
     }
 
     /**
-     * Return the number of bytes that are currently pinned to buffer instances, by the arena. The pinned memory is not
-     * accessible for use by any other allocation, until the buffers using have all been released.
+     * Return an estimate of the number of bytes that are currently pinned to buffer instances, by the arena. The
+     * pinned memory is not accessible for use by any other allocation, until the buffers using have all been released.
      */
     public long numPinnedBytes() {
         long val = activeBytesHuge.value(); // Huge chunks are exact-sized for the buffers they were allocated to.
-        synchronized (this) {
-            for (int i = 0; i < chunkListMetrics.size(); i++) {
-                for (PoolChunkMetric m: chunkListMetrics.get(i)) {
-                    val += ((PoolChunk<?>) m).pinnedBytes();
-                }
+        for (int i = 0; i < chunkListMetrics.size(); i++) {
+            for (PoolChunkMetric m: chunkListMetrics.get(i)) {
+                val += ((PoolChunk<?>) m).pinnedBytes();
             }
         }
         return max(0, val);
@@ -479,43 +536,47 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     protected abstract void destroyChunk(PoolChunk<T> chunk);
 
     @Override
-    public synchronized String toString() {
-        StringBuilder buf = new StringBuilder()
-            .append("Chunk(s) at 0~25%:")
-            .append(StringUtil.NEWLINE)
-            .append(qInit)
-            .append(StringUtil.NEWLINE)
-            .append("Chunk(s) at 0~50%:")
-            .append(StringUtil.NEWLINE)
-            .append(q000)
-            .append(StringUtil.NEWLINE)
-            .append("Chunk(s) at 25~75%:")
-            .append(StringUtil.NEWLINE)
-            .append(q025)
-            .append(StringUtil.NEWLINE)
-            .append("Chunk(s) at 50~100%:")
-            .append(StringUtil.NEWLINE)
-            .append(q050)
-            .append(StringUtil.NEWLINE)
-            .append("Chunk(s) at 75~100%:")
-            .append(StringUtil.NEWLINE)
-            .append(q075)
-            .append(StringUtil.NEWLINE)
-            .append("Chunk(s) at 100%:")
-            .append(StringUtil.NEWLINE)
-            .append(q100)
-            .append(StringUtil.NEWLINE)
-            .append("small subpages:");
-        appendPoolSubPages(buf, smallSubpagePools);
-        buf.append(StringUtil.NEWLINE);
-
-        return buf.toString();
+    public String toString() {
+        lock();
+        try {
+            StringBuilder buf = new StringBuilder()
+                    .append("Chunk(s) at 0~25%:")
+                    .append(StringUtil.NEWLINE)
+                    .append(qInit)
+                    .append(StringUtil.NEWLINE)
+                    .append("Chunk(s) at 0~50%:")
+                    .append(StringUtil.NEWLINE)
+                    .append(q000)
+                    .append(StringUtil.NEWLINE)
+                    .append("Chunk(s) at 25~75%:")
+                    .append(StringUtil.NEWLINE)
+                    .append(q025)
+                    .append(StringUtil.NEWLINE)
+                    .append("Chunk(s) at 50~100%:")
+                    .append(StringUtil.NEWLINE)
+                    .append(q050)
+                    .append(StringUtil.NEWLINE)
+                    .append("Chunk(s) at 75~100%:")
+                    .append(StringUtil.NEWLINE)
+                    .append(q075)
+                    .append(StringUtil.NEWLINE)
+                    .append("Chunk(s) at 100%:")
+                    .append(StringUtil.NEWLINE)
+                    .append(q100)
+                    .append(StringUtil.NEWLINE)
+                    .append("small subpages:");
+            appendPoolSubPages(buf, smallSubpagePools);
+            buf.append(StringUtil.NEWLINE);
+            return buf.toString();
+        } finally {
+            unlock();
+        }
     }
 
     private static void appendPoolSubPages(StringBuilder buf, PoolSubpage<?>[] subpages) {
         for (int i = 0; i < subpages.length; i ++) {
             PoolSubpage<?> head = subpages[i];
-            if (head.next == head) {
+            if (head.next == head || head.next == null) {
                 continue;
             }
 
@@ -523,7 +584,7 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
                     .append(i)
                     .append(": ");
             PoolSubpage<?> s = head.next;
-            for (;;) {
+            while (s != null) {
                 buf.append(s);
                 s = s.next;
                 if (s == head) {
@@ -556,11 +617,11 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
     }
 
     static final class HeapArena extends PoolArena<byte[]> {
+        private final AtomicReference<PoolChunk<byte[]>> lastDestroyedChunk;
 
-        HeapArena(PooledByteBufAllocator parent, int pageSize, int pageShifts,
-                  int chunkSize) {
-            super(parent, pageSize, pageShifts, chunkSize,
-                  0);
+        HeapArena(PooledByteBufAllocator parent, SizeClasses sizeClass) {
+            super(parent, sizeClass);
+            lastDestroyedChunk = new AtomicReference<PoolChunk<byte[]>>();
         }
 
         private static byte[] newByteArray(int size) {
@@ -574,6 +635,14 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
 
         @Override
         protected PoolChunk<byte[]> newChunk(int pageSize, int maxPageIdx, int pageShifts, int chunkSize) {
+            PoolChunk<byte[]> chunk = lastDestroyedChunk.getAndSet(null);
+            if (chunk != null) {
+                assert chunk.chunkSize == chunkSize &&
+                        chunk.pageSize == pageSize &&
+                        chunk.maxPageIdx == maxPageIdx &&
+                        chunk.pageShifts == pageShifts;
+                return chunk; // The parameters are always the same, so it's fine to reuse a previously allocated chunk.
+            }
             return new PoolChunk<byte[]>(
                     this, null, newByteArray(chunkSize), pageSize, pageShifts, chunkSize, maxPageIdx);
         }
@@ -585,7 +654,10 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
 
         @Override
         protected void destroyChunk(PoolChunk<byte[]> chunk) {
-            // Rely on GC.
+            // Rely on GC. But keep one chunk for reuse.
+            if (!chunk.unpooled && lastDestroyedChunk.get() == null) {
+                lastDestroyedChunk.set(chunk); // The check-and-set does not need to be atomic.
+            }
         }
 
         @Override
@@ -606,10 +678,8 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
 
     static final class DirectArena extends PoolArena<ByteBuffer> {
 
-        DirectArena(PooledByteBufAllocator parent, int pageSize, int pageShifts,
-                    int chunkSize, int directMemoryCacheAlignment) {
-            super(parent, pageSize, pageShifts, chunkSize,
-                  directMemoryCacheAlignment);
+        DirectArena(PooledByteBufAllocator parent, SizeClasses sizeClass) {
+            super(parent, sizeClass);
         }
 
         @Override
@@ -618,29 +688,28 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
         }
 
         @Override
-        protected PoolChunk<ByteBuffer> newChunk(int pageSize, int maxPageIdx,
-            int pageShifts, int chunkSize) {
-            if (directMemoryCacheAlignment == 0) {
+        protected PoolChunk<ByteBuffer> newChunk(int pageSize, int maxPageIdx, int pageShifts, int chunkSize) {
+            if (sizeClass.directMemoryCacheAlignment == 0) {
                 ByteBuffer memory = allocateDirect(chunkSize);
                 return new PoolChunk<ByteBuffer>(this, memory, memory, pageSize, pageShifts,
                         chunkSize, maxPageIdx);
             }
 
-            final ByteBuffer base = allocateDirect(chunkSize + directMemoryCacheAlignment);
-            final ByteBuffer memory = PlatformDependent.alignDirectBuffer(base, directMemoryCacheAlignment);
+            final ByteBuffer base = allocateDirect(chunkSize + sizeClass.directMemoryCacheAlignment);
+            final ByteBuffer memory = PlatformDependent.alignDirectBuffer(base, sizeClass.directMemoryCacheAlignment);
             return new PoolChunk<ByteBuffer>(this, base, memory, pageSize,
                     pageShifts, chunkSize, maxPageIdx);
         }
 
         @Override
         protected PoolChunk<ByteBuffer> newUnpooledChunk(int capacity) {
-            if (directMemoryCacheAlignment == 0) {
+            if (sizeClass.directMemoryCacheAlignment == 0) {
                 ByteBuffer memory = allocateDirect(capacity);
                 return new PoolChunk<ByteBuffer>(this, memory, memory, capacity);
             }
 
-            final ByteBuffer base = allocateDirect(capacity + directMemoryCacheAlignment);
-            final ByteBuffer memory = PlatformDependent.alignDirectBuffer(base, directMemoryCacheAlignment);
+            final ByteBuffer base = allocateDirect(capacity + sizeClass.directMemoryCacheAlignment);
+            final ByteBuffer memory = PlatformDependent.alignDirectBuffer(base, sizeClass.directMemoryCacheAlignment);
             return new PoolChunk<ByteBuffer>(this, base, memory, capacity);
         }
 
@@ -686,5 +755,53 @@ abstract class PoolArena<T> extends SizeClasses implements PoolArenaMetric {
                 dst.put(src);
             }
         }
+    }
+
+    void lock() {
+        lock.lock();
+    }
+
+    void unlock() {
+        lock.unlock();
+    }
+
+    @Override
+    public int sizeIdx2size(int sizeIdx) {
+        return sizeClass.sizeIdx2size(sizeIdx);
+    }
+
+    @Override
+    public int sizeIdx2sizeCompute(int sizeIdx) {
+        return sizeClass.sizeIdx2sizeCompute(sizeIdx);
+    }
+
+    @Override
+    public long pageIdx2size(int pageIdx) {
+        return sizeClass.pageIdx2size(pageIdx);
+    }
+
+    @Override
+    public long pageIdx2sizeCompute(int pageIdx) {
+        return sizeClass.pageIdx2sizeCompute(pageIdx);
+    }
+
+    @Override
+    public int size2SizeIdx(int size) {
+        return sizeClass.size2SizeIdx(size);
+    }
+
+    @Override
+    public int pages2pageIdx(int pages) {
+        return sizeClass.pages2pageIdx(pages);
+    }
+
+    @Override
+    public int pages2pageIdxFloor(int pages) {
+        return sizeClass.pages2pageIdxFloor(pages);
+    }
+
+    @Override
+    public int normalizeSize(int size) {
+        return sizeClass.normalizeSize(size);
     }
 }

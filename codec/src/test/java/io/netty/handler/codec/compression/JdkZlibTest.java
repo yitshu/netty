@@ -15,7 +15,9 @@
  */
 package io.netty.handler.codec.compression;
 
+import io.netty.buffer.AbstractByteBufAllocator;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.util.CharsetUtil;
@@ -29,8 +31,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Queue;
+import java.util.zip.Deflater;
 import java.util.zip.GZIPOutputStream;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -84,7 +88,7 @@ public class JdkZlibTest extends ZlibTest {
 
     @Test
     public void testConcatenatedStreamsReadFully() throws IOException {
-        EmbeddedChannel chDecoderGZip = new EmbeddedChannel(new JdkZlibDecoder(true));
+        EmbeddedChannel chDecoderGZip = new EmbeddedChannel(new JdkZlibDecoder(true, 0));
 
         try {
             byte[] bytes = IOUtils.toByteArray(getClass().getResourceAsStream("/multiple.gz"));
@@ -106,7 +110,7 @@ public class JdkZlibTest extends ZlibTest {
 
     @Test
     public void testConcatenatedStreamsReadFullyWhenFragmented() throws IOException {
-        EmbeddedChannel chDecoderGZip = new EmbeddedChannel(new JdkZlibDecoder(true));
+        EmbeddedChannel chDecoderGZip = new EmbeddedChannel(new JdkZlibDecoder(true, 0));
 
         try {
             byte[] bytes = IOUtils.toByteArray(getClass().getResourceAsStream("/multiple.gz"));
@@ -145,7 +149,7 @@ public class JdkZlibTest extends ZlibTest {
 
         byte[] compressed = bytesOut.toByteArray();
         ByteBuf buffer = Unpooled.buffer().writeBytes(compressed).writeBytes(compressed);
-        EmbeddedChannel channel = new EmbeddedChannel(new JdkZlibDecoder(ZlibWrapper.GZIP, true));
+        EmbeddedChannel channel = new EmbeddedChannel(new JdkZlibDecoder(ZlibWrapper.GZIP, true, 0));
         // Write it into the Channel in a way that we were able to decompress the first data completely but not the
         // whole footer.
         assertTrue(channel.writeInbound(buffer.readRetainedSlice(compressed.length - 1)));
@@ -163,5 +167,59 @@ public class JdkZlibTest extends ZlibTest {
 
         assertNull(channel.readInbound());
         uncompressedBuffer.release();
+    }
+
+    @Test
+    public void testLargeEncode() throws Exception {
+        // construct a 128M buffer out of many times the same 1M buffer :)
+        byte[] smallArray = new byte[1024 * 1024];
+        byte[][] arrayOfArrays = new byte[128][];
+        Arrays.fill(arrayOfArrays, smallArray);
+        ByteBuf bigBuffer = Unpooled.wrappedBuffer(arrayOfArrays);
+
+        EmbeddedChannel channel = new EmbeddedChannel(new JdkZlibEncoder(ZlibWrapper.NONE));
+        channel.config().setAllocator(new LimitedByteBufAllocator(channel.alloc()));
+        assertTrue(channel.writeOutbound(bigBuffer));
+        assertTrue(channel.finish());
+        channel.checkException();
+        assertTrue(channel.releaseOutbound());
+    }
+
+    @Test
+    void testAllowDefaultCompression() {
+        assertDoesNotThrow(new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                new JdkZlibEncoder(Deflater.DEFAULT_COMPRESSION);
+            }
+        });
+    }
+
+    /**
+     * Allocator that will limit buffer capacity to 1M.
+     */
+    private static final class LimitedByteBufAllocator extends AbstractByteBufAllocator {
+        private static final int MAX = 1024 * 1024;
+
+        private final ByteBufAllocator wrapped;
+
+        LimitedByteBufAllocator(ByteBufAllocator wrapped) {
+            this.wrapped = wrapped;
+        }
+
+        @Override
+        public boolean isDirectBufferPooled() {
+            return wrapped.isDirectBufferPooled();
+        }
+
+        @Override
+        protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
+            return wrapped.heapBuffer(initialCapacity, Math.min(maxCapacity, MAX));
+        }
+
+        @Override
+        protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {
+            return wrapped.directBuffer(initialCapacity, Math.min(maxCapacity, MAX));
+        }
     }
 }

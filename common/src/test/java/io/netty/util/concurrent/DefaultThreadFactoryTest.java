@@ -27,9 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class DefaultThreadFactoryTest {
 
@@ -274,7 +272,6 @@ public class DefaultThreadFactoryTest {
         final AtomicReference<ThreadGroup> firstCaptured = new AtomicReference<ThreadGroup>();
 
         final ThreadGroup group = new ThreadGroup("first");
-        assertFalse(group.isDestroyed());
         final Thread first = new Thread(group, new Runnable() {
             @Override
             public void run() {
@@ -285,9 +282,6 @@ public class DefaultThreadFactoryTest {
         });
         first.start();
         first.join();
-        // Destroy the group now
-        group.destroy();
-        assertTrue(group.isDestroyed());
         assertEquals(group, firstCaptured.get());
 
         ThreadGroup currentThreadGroup = Thread.currentThread().getThreadGroup();

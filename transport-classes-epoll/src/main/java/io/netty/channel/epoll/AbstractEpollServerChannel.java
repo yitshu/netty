@@ -34,11 +34,11 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
         this(new LinuxSocket(fd), false);
     }
 
-    AbstractEpollServerChannel(LinuxSocket fd) {
+    protected AbstractEpollServerChannel(LinuxSocket fd) {
         this(fd, isSoErrorZero(fd));
     }
 
-    AbstractEpollServerChannel(LinuxSocket fd, boolean active) {
+    protected AbstractEpollServerChannel(LinuxSocket fd, boolean active) {
         super(null, fd, active);
     }
 
@@ -72,13 +72,12 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
         throw new UnsupportedOperationException();
     }
 
-    abstract Channel newChildChannel(int fd, byte[] remote, int offset, int len) throws Exception;
+    protected abstract Channel newChildChannel(int fd, byte[] remote, int offset, int len) throws Exception;
 
     final class EpollServerSocketUnsafe extends AbstractEpollUnsafe {
         // Will hold the remote address after accept(...) was successful.
         // We need 24 bytes for the address as maximum + 1 byte for storing the length.
-        // So use 26 bytes as it's a power of two.
-        private final byte[] acceptedAddress = new byte[26];
+        private final byte[] acceptedAddress = new byte[25];
 
         @Override
         public void connect(SocketAddress socketAddress, SocketAddress socketAddress2, ChannelPromise channelPromise) {

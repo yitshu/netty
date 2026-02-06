@@ -32,6 +32,7 @@ import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -78,6 +79,9 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
      * Set the {@link EventLoopGroup} for the parent (acceptor) and the child (client). These
      * {@link EventLoopGroup}'s are used to handle all the events and IO for {@link ServerChannel} and
      * {@link Channel}'s.
+     * <p>
+     * <strong>Important:</strong> Usually this is only useful for advanced use-cases and usually
+     * {@link #group(EventLoopGroup)} is the preferred way to configure the group.
      */
     public ServerBootstrap group(EventLoopGroup parentGroup, EventLoopGroup childGroup) {
         super.group(parentGroup);
@@ -128,7 +132,7 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
     }
 
     @Override
-    void init(Channel channel) {
+    void init(Channel channel) throws Throwable {
         setChannelOptions(channel, newOptionsArray(), logger);
         setAttributes(channel, newAttributesArray());
 
@@ -138,6 +142,7 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
         final ChannelHandler currentChildHandler = childHandler;
         final Entry<ChannelOption<?>, Object>[] currentChildOptions = newOptionsArray(childOptions);
         final Entry<AttributeKey<?>, Object>[] currentChildAttrs = newAttributesArray(childAttrs);
+        final Collection<ChannelInitializerExtension> extensions = getInitializerExtensions();
 
         p.addLast(new ChannelInitializer<Channel>() {
             @Override
@@ -152,11 +157,22 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
                     @Override
                     public void run() {
                         pipeline.addLast(new ServerBootstrapAcceptor(
-                                ch, currentChildGroup, currentChildHandler, currentChildOptions, currentChildAttrs));
+                                ch, currentChildGroup, currentChildHandler, currentChildOptions, currentChildAttrs,
+                                extensions));
                     }
                 });
             }
         });
+        if (!extensions.isEmpty() && channel instanceof ServerChannel) {
+            ServerChannel serverChannel = (ServerChannel) channel;
+            for (ChannelInitializerExtension extension : extensions) {
+                try {
+                    extension.postInitializeServerListenerChannel(serverChannel);
+                } catch (Exception e) {
+                    logger.warn("Exception thrown from postInitializeServerListenerChannel", e);
+                }
+            }
+        }
     }
 
     @Override
@@ -179,14 +195,17 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
         private final Entry<ChannelOption<?>, Object>[] childOptions;
         private final Entry<AttributeKey<?>, Object>[] childAttrs;
         private final Runnable enableAutoReadTask;
+        private final Collection<ChannelInitializerExtension> extensions;
 
         ServerBootstrapAcceptor(
                 final Channel channel, EventLoopGroup childGroup, ChannelHandler childHandler,
-                Entry<ChannelOption<?>, Object>[] childOptions, Entry<AttributeKey<?>, Object>[] childAttrs) {
+                Entry<ChannelOption<?>, Object>[] childOptions, Entry<AttributeKey<?>, Object>[] childAttrs,
+                Collection<ChannelInitializerExtension> extensions) {
             this.childGroup = childGroup;
             this.childHandler = childHandler;
             this.childOptions = childOptions;
             this.childAttrs = childAttrs;
+            this.extensions = extensions;
 
             // Task which is scheduled to re-enable auto-read.
             // It's important to create this Runnable before we try to submit it as otherwise the URLClassLoader may
@@ -208,8 +227,23 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
 
             child.pipeline().addLast(childHandler);
 
-            setChannelOptions(child, childOptions, logger);
+            try {
+                setChannelOptions(child, childOptions, logger);
+            } catch (Throwable cause) {
+                forceClose(child, cause);
+                return;
+            }
             setAttributes(child, childAttrs);
+
+            if (!extensions.isEmpty()) {
+                for (ChannelInitializerExtension extension : extensions) {
+                    try {
+                        extension.postInitializeServerChildChannel(child);
+                    } catch (Exception e) {
+                        logger.warn("Exception thrown from postInitializeServerChildChannel", e);
+                    }
+                }
+            }
 
             try {
                 childGroup.register(child).addListener(new ChannelFutureListener() {

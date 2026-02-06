@@ -16,8 +16,6 @@
 package io.netty.util.concurrent;
 
 import org.junit.jupiter.api.Test;
-
-import io.netty.util.concurrent.AbstractEventExecutor.LazyRunnable;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.function.Executable;
 
@@ -35,10 +33,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.hamcrest.CoreMatchers.*;
-import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -208,12 +205,18 @@ public class SingleThreadEventExecutorTest {
         }
     }
 
-    static class LazyLatchTask extends LatchTask implements LazyRunnable { }
+    static class LazyLatchTask extends LatchTask { }
 
     @Test
     public void testLazyExecution() throws Exception {
         final SingleThreadEventExecutor executor = new SingleThreadEventExecutor(null,
                 Executors.defaultThreadFactory(), false) {
+
+            @Override
+            protected boolean wakesUpForTask(final Runnable task) {
+                return !(task instanceof LazyLatchTask);
+            }
+
             @Override
             protected void run() {
                 while (!confirmShutdown()) {
@@ -368,9 +371,10 @@ public class SingleThreadEventExecutorTest {
 
         f.sync();
 
-        assertThat(beforeTask.ran.get(), is(true));
-        assertThat(scheduledTask.ran.get(), is(true));
-        assertThat(afterTask.ran.get(), is(true));
+        assertTrue(beforeTask.ran.get());
+        assertTrue(scheduledTask.ran.get());
+        assertTrue(afterTask.ran.get());
+        executor.shutdownGracefully(0, 0, TimeUnit.MILLISECONDS).syncUninterruptibly();
     }
 
     @Test
@@ -408,7 +412,8 @@ public class SingleThreadEventExecutorTest {
 
         f.sync();
 
-        assertThat(t.ran.get(), is(true));
+        assertTrue(t.ran.get());
+        executor.shutdownGracefully(0, 0, TimeUnit.MILLISECONDS).syncUninterruptibly();
     }
 
     private static final class TestRunnable implements Runnable {
@@ -421,5 +426,30 @@ public class SingleThreadEventExecutorTest {
         public void run() {
             ran.set(true);
         }
+    }
+
+    @Test
+    @Timeout(value = 5000, unit = TimeUnit.MILLISECONDS)
+    public void testExceptionIsPropagatedToTerminationFuture() throws Exception {
+        final IllegalStateException exception = new IllegalStateException();
+        final SingleThreadEventExecutor executor =
+                new SingleThreadEventExecutor(null, Executors.defaultThreadFactory(), true) {
+                    @Override
+                    protected void run() {
+                        throw exception;
+                    }
+                };
+
+        // Schedule something so we are sure the run() method will be called.
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                // Noop.
+            }
+        });
+
+        executor.terminationFuture().await();
+
+        assertSame(exception, executor.terminationFuture().cause());
     }
 }

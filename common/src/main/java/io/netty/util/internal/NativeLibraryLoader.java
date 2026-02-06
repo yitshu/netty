@@ -223,10 +223,14 @@ public final class NativeLibraryLoader {
                     // Pass "io.netty.native.workdir" as an argument to allow shading tools to see
                     // the string. Since this is printed out to users to tell them what to do next,
                     // we want the value to be correct even when shading.
-                    logger.info("{} exists but cannot be executed even when execute permissions set; " +
-                                "check volume for \"noexec\" flag; use -D{}=[path] " +
-                                "to set native working directory separately.",
-                                tmpFile.getPath(), "io.netty.native.workdir");
+                    String message = String.format(
+                            "%s exists but cannot be executed even when execute permissions set; " +
+                                    "check volume for \"noexec\" flag; use -D%s=[path] " +
+                                    "to set native working directory separately.",
+                            tmpFile.getPath(), "io.netty.native.workdir");
+                    logger.info(message);
+                    suppressed.add(ThrowableUtil.unknownStackTrace(
+                            new UnsatisfiedLinkError(message), NativeLibraryLoader.class, "load"));
                 }
             } catch (Throwable t) {
                 suppressed.add(t);
@@ -327,6 +331,11 @@ public final class NativeLibraryLoader {
     }
 
     static void tryPatchShadedLibraryIdAndSign(File libraryFile, String originalName) {
+        if (!new File("/Library/Developer/CommandLineTools").exists()) {
+            logger.debug("Can't patch shaded library id as CommandLineTools are not installed." +
+                    " Consider installing CommandLineTools with 'xcode-select --install'");
+            return;
+        }
         String newId = new String(generateUniqueId(originalName.length()), CharsetUtil.UTF_8);
         if (!tryExec("install_name_tool -id " + newId + " " + libraryFile.getAbsolutePath())) {
             return;
@@ -418,7 +427,7 @@ public final class NativeLibraryLoader {
             @Override
             public Object run() {
                 try {
-                    // Invoke the helper to load the native library, if succeed, then the native
+                    // Invoke the helper to load the native library, if it succeeds, then the native
                     // library belong to the specified ClassLoader.
                     Method method = helper.getMethod("loadLibrary", String.class, boolean.class);
                     method.setAccessible(true);

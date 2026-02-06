@@ -35,7 +35,6 @@ import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.util.AsciiString;
 import io.netty.util.internal.InternalThreadLocalMap;
-import io.netty.util.internal.UnstableApi;
 
 import java.net.URI;
 import java.util.Iterator;
@@ -68,7 +67,6 @@ import static io.netty.util.internal.StringUtil.unescapeCsvFields;
 /**
  * Provides utility methods and constants for the HTTP/2 to HTTP conversion
  */
-@UnstableApi
 public final class HttpConversionUtil {
     /**
      * The set of headers that should not be directly copied when converting headers from HTTP to HTTP/2.
@@ -435,16 +433,19 @@ public final class HttpConversionUtil {
         final Http2Headers out = new DefaultHttp2Headers(validateHeaders, inHeaders.size());
         if (in instanceof HttpRequest) {
             HttpRequest request = (HttpRequest) in;
-            URI requestTargetUri = URI.create(request.uri());
-            out.path(toHttp2Path(requestTargetUri));
-            out.method(request.method().asciiName());
-            setHttp2Scheme(inHeaders, requestTargetUri, out);
-
-            if (!isOriginForm(requestTargetUri) && !isAsteriskForm(requestTargetUri)) {
-                // Attempt to take from HOST header before taking from the request-line
-                String host = inHeaders.getAsString(HttpHeaderNames.HOST);
-                setHttp2Authority(host == null || host.isEmpty() ? requestTargetUri.getAuthority() : host, out);
+            String host = inHeaders.getAsString(HttpHeaderNames.HOST);
+            if (isOriginForm(request.uri()) || isAsteriskForm(request.uri())) {
+                out.path(new AsciiString(request.uri()));
+                setHttp2Scheme(inHeaders, out);
+            } else {
+                URI requestTargetUri = URI.create(request.uri());
+                out.path(toHttp2Path(requestTargetUri));
+                // Take from the request-line if HOST header was empty
+                host = isNullOrEmpty(host) ? requestTargetUri.getAuthority() : host;
+                setHttp2Scheme(inHeaders, requestTargetUri, out);
             }
+            setHttp2Authority(host, out);
+            out.method(request.method().asciiName());
         } else if (in instanceof HttpResponse) {
             HttpResponse response = (HttpResponse) in;
             out.status(response.status().codeAsText());
@@ -531,35 +532,62 @@ public final class HttpConversionUtil {
                 if (aName.contentEqualsIgnoreCase(TE)) {
                     toHttp2HeadersFilterTE(entry, out);
                 } else if (aName.contentEqualsIgnoreCase(COOKIE)) {
-                    AsciiString value = AsciiString.of(entry.getValue());
-                    // split up cookies to allow for better compression
-                    // https://tools.ietf.org/html/rfc7540#section-8.1.2.5
-                    try {
-                        int index = value.forEachByte(FIND_SEMI_COLON);
-                        if (index != -1) {
-                            int start = 0;
-                            do {
-                                out.add(COOKIE, value.subSequence(start, index, false));
-                                // skip 2 characters "; " (see https://tools.ietf.org/html/rfc6265#section-4.2.1)
-                                start = index + 2;
-                            } while (start < value.length() &&
-                                    (index = value.forEachByte(start, value.length() - start, FIND_SEMI_COLON)) != -1);
-                            if (start >= value.length()) {
-                                throw new IllegalArgumentException("cookie value is of unexpected format: " + value);
+                    CharSequence valueCs = entry.getValue();
+                    // validate
+                    boolean invalid = false;
+                    for (int i = 0; i < valueCs.length(); i++) {
+                        char c = valueCs.charAt(i);
+                        if (c == ';') {
+                            if (i + 1 >= valueCs.length() || valueCs.charAt(i + 1) != ' ') {
+                                // semicolon not followed by space. invalid, don't split
+                                invalid = true;
+                                break;
                             }
-                            out.add(COOKIE, value.subSequence(start, value.length(), false));
-                        } else {
-                            out.add(COOKIE, value);
+                            i++; // skip space
+                        } else if (c > 255) {
+                            // not ascii, don't split
+                            invalid = true;
+                            break;
                         }
-                    } catch (Exception e) {
-                        // This is not expect to happen because FIND_SEMI_COLON never throws but must be caught
-                        // because of the ByteProcessor interface.
-                        throw new IllegalStateException(e);
+                    }
+
+                    if (invalid) {
+                        out.add(COOKIE, valueCs);
+                    } else {
+                        splitValidCookieHeader(out, valueCs);
                     }
                 } else {
                     out.add(aName, entry.getValue());
                 }
             }
+        }
+    }
+
+    private static void splitValidCookieHeader(Http2Headers out, CharSequence valueCs) {
+        try {
+            AsciiString value = AsciiString.of(valueCs);
+            // split up cookies to allow for better compression
+            // https://tools.ietf.org/html/rfc7540#section-8.1.2.5
+            int index = value.forEachByte(FIND_SEMI_COLON);
+            if (index != -1) {
+                int start = 0;
+                do {
+                    out.add(COOKIE, value.subSequence(start, index, false));
+                    assert index + 1 < value.length();
+                    assert value.charAt(index + 1) == ' ';
+                    // skip 2 characters "; " (see https://tools.ietf.org/html/rfc6265#section-4.2.1)
+                    start = index + 2;
+                } while (start < value.length() &&
+                        (index = value.forEachByte(start, value.length() - start, FIND_SEMI_COLON)) != -1);
+                assert start < value.length();
+                out.add(COOKIE, value.subSequence(start, value.length(), false));
+            } else {
+                out.add(COOKIE, value);
+            }
+        } catch (Exception e) {
+            // This is not expect to happen because FIND_SEMI_COLON never throws but must be caught
+            // because of the ByteProcessor interface.
+            throw new IllegalStateException(e);
         }
     }
 
@@ -602,9 +630,13 @@ public final class HttpConversionUtil {
         }
     }
 
+    private static void setHttp2Scheme(HttpHeaders in, Http2Headers out) {
+        setHttp2Scheme(in, URI.create(""), out);
+    }
+
     private static void setHttp2Scheme(HttpHeaders in, URI uri, Http2Headers out) {
         String value = uri.getScheme();
-        if (value != null) {
+        if (!isNullOrEmpty(value)) {
             out.scheme(new AsciiString(value));
             return;
         }

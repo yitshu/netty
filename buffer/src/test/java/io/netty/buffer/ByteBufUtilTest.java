@@ -33,12 +33,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.netty.buffer.Unpooled.unreleasableBuffer;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.greaterThan;
-import static org.hamcrest.Matchers.is;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -282,6 +281,72 @@ public class ByteBufUtilTest {
         assertEquals(ByteBufUtil.swapMedium(mediumValue), buf.readMediumLE());
         buf.resetReaderIndex();
         assertEquals(ByteBufUtil.swapMedium(mediumValue), buf.readMedium());
+        buf.release();
+    }
+
+    @SuppressWarnings("deprecation")
+    @ParameterizedTest(name = PARAMETERIZED_NAME)
+    @MethodSource("noUnsafe")
+    public void readUnsignedShortBE(BufferType bufferType) {
+        int shortValue = 0x1234; // unsigned short
+        int swappedShortValue = 0x3412; // swapped version of the value above
+
+        ByteBuf buf = buffer(bufferType, 2).order(ByteOrder.BIG_ENDIAN);
+        buf.writeShort(shortValue);
+        assertEquals(shortValue, ByteBufUtil.readUnsignedShortBE(buf));
+        buf.clear();
+        buf.writeShortLE(shortValue);
+        assertEquals(swappedShortValue, ByteBufUtil.readUnsignedShortBE(buf));
+        buf.release();
+
+        buf = buffer(bufferType, 2).order(ByteOrder.LITTLE_ENDIAN);
+        buf.writeShort(shortValue);
+        assertEquals(swappedShortValue, ByteBufUtil.readUnsignedShortBE(buf));
+        buf.clear();
+        buf.writeShortLE(shortValue);
+        assertEquals(swappedShortValue, ByteBufUtil.readUnsignedShortBE(buf));
+        buf.release();
+
+        shortValue = 0xfedc; // unsigned short
+        swappedShortValue = 0xdcfe; // swapped version of the value above
+
+        buf = buffer(bufferType, 2).order(ByteOrder.BIG_ENDIAN);
+        buf.writeShort(shortValue);
+        assertEquals(shortValue, ByteBufUtil.readUnsignedShortBE(buf));
+        buf.clear();
+        buf.writeShortLE(shortValue);
+        assertEquals(swappedShortValue, ByteBufUtil.readUnsignedShortBE(buf));
+        buf.release();
+
+        buf = buffer(bufferType, 2).order(ByteOrder.LITTLE_ENDIAN);
+        buf.writeShort(shortValue);
+        assertEquals(swappedShortValue, ByteBufUtil.readUnsignedShortBE(buf));
+        buf.clear();
+        buf.writeShortLE(shortValue);
+        assertEquals(swappedShortValue, ByteBufUtil.readUnsignedShortBE(buf));
+        buf.release();
+    }
+
+    @SuppressWarnings("deprecation")
+    @ParameterizedTest(name = PARAMETERIZED_NAME)
+    @MethodSource("noUnsafe")
+    public void readIntBE(BufferType bufferType) {
+        int intValue = 0x12345678;
+
+        ByteBuf buf = buffer(bufferType, 4).order(ByteOrder.BIG_ENDIAN);
+        buf.writeInt(intValue);
+        assertEquals(intValue, ByteBufUtil.readIntBE(buf));
+        buf.clear();
+        buf.writeIntLE(intValue);
+        assertEquals(ByteBufUtil.swapInt(intValue), ByteBufUtil.readIntBE(buf));
+        buf.release();
+
+        buf = buffer(bufferType, 4).order(ByteOrder.LITTLE_ENDIAN);
+        buf.writeInt(intValue);
+        assertEquals(ByteBufUtil.swapInt(intValue), ByteBufUtil.readIntBE(buf));
+        buf.clear();
+        buf.writeIntLE(intValue);
+        assertEquals(ByteBufUtil.swapInt(intValue), ByteBufUtil.readIntBE(buf));
         buf.release();
     }
 
@@ -617,7 +682,7 @@ public class ByteBufUtilTest {
     }
 
     private static void assertWrapped(ByteBuf buf) {
-        assertTrue(buf instanceof WrappedByteBuf);
+        assertInstanceOf(WrappedByteBuf.class, buf);
     }
 
     @ParameterizedTest(name = PARAMETERIZED_NAME)
@@ -967,8 +1032,8 @@ public class ByteBufUtilTest {
             slice.writerIndex(0);
 
             assertTrue(slice.hasArray());
-            assertThat(slice.arrayOffset(), is(1));
-            assertThat(slice.array().length, is(buf.capacity()));
+            assertEquals(1, slice.arrayOffset());
+            assertEquals(buf.capacity(), slice.array().length);
 
             checkGetBytes(slice);
         } finally {
@@ -988,8 +1053,8 @@ public class ByteBufUtilTest {
             slice.writerIndex(0);
 
             assertTrue(slice.hasArray());
-            assertThat(slice.arrayOffset(), is(0));
-            assertThat(slice.array().length, greaterThan(slice.capacity()));
+            assertEquals(0, slice.arrayOffset());
+            assertThat(slice.array().length).isGreaterThan(slice.capacity());
 
             checkGetBytes(slice);
         } finally {

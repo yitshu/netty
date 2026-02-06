@@ -24,7 +24,6 @@ import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.unix.IntegerUnixChannelOption;
 import io.netty.channel.unix.RawUnixChannelOption;
-import io.netty.util.internal.UnstableApi;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -34,7 +33,6 @@ import static io.netty.channel.kqueue.KQueueChannelOption.RCV_ALLOC_TRANSPORT_PR
 import static io.netty.channel.unix.Limits.SSIZE_MAX;
 import static java.lang.Math.min;
 
-@UnstableApi
 public class KQueueChannelConfig extends DefaultChannelConfig {
     private volatile boolean transportProvidesGuess;
     private volatile long maxBytesPerGatheringWrite = SSIZE_MAX;
@@ -67,7 +65,7 @@ public class KQueueChannelConfig extends DefaultChannelConfig {
             }
             if (option instanceof RawUnixChannelOption) {
                 RawUnixChannelOption opt = (RawUnixChannelOption) option;
-                ByteBuffer out = ByteBuffer.allocate(opt.level());
+                ByteBuffer out = ByteBuffer.allocate(opt.length());
                 ((AbstractKQueueChannel) channel).socket.getRawOpt(opt.level(), opt.optname(), out);
                 return (T) out.flip();
             }

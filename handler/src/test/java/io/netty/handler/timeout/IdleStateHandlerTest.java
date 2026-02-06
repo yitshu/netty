@@ -29,8 +29,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -68,7 +67,7 @@ public class IdleStateHandlerTest {
     }
 
     private static void anyIdle(TestableIdleStateHandler idleStateHandler, Object... expected) throws Exception {
-        assertThat(expected.length,  greaterThanOrEqualTo(1));
+        assertThat(expected.length).isGreaterThanOrEqualTo(1);
 
         final List<Object> events = new ArrayList<Object>();
         ChannelInboundHandlerAdapter handler = new ChannelInboundHandlerAdapter() {
@@ -97,6 +96,36 @@ public class IdleStateHandlerTest {
         } finally {
             channel.finishAndReleaseAll();
         }
+    }
+
+    @Test
+    public void testResetReader() throws Exception {
+        final TestableIdleStateHandler idleStateHandler = new TestableIdleStateHandler(
+                false, 1L, 0L, 0L, TimeUnit.SECONDS);
+
+        Action action = new Action() {
+            @Override
+            public void run(EmbeddedChannel channel) throws Exception {
+                idleStateHandler.resetReadTimeout();
+            }
+        };
+
+        anyNotIdle(idleStateHandler, action, IdleStateEvent.FIRST_READER_IDLE_STATE_EVENT);
+    }
+
+    @Test
+    public void testResetWriter() throws Exception {
+        final TestableIdleStateHandler idleStateHandler = new TestableIdleStateHandler(
+                false, 0L, 1L, 0L, TimeUnit.SECONDS);
+
+        Action action = new Action() {
+            @Override
+            public void run(EmbeddedChannel channel) throws Exception {
+                idleStateHandler.resetWriteTimeout();
+            }
+        };
+
+        anyNotIdle(idleStateHandler, action, IdleStateEvent.FIRST_WRITER_IDLE_STATE_EVENT);
     }
 
     @Test
@@ -171,16 +200,16 @@ public class IdleStateHandlerTest {
 
         EmbeddedChannel channel = new EmbeddedChannel(idleStateHandler, handler);
         try {
-            idleStateHandler.tick(1L, TimeUnit.NANOSECONDS);
-            action.run(channel);
-
-            // Advance the ticker by some fraction and run() the task.
-            // There shouldn't be an IdleStateEvent getting fired because
-            // we've just performed an action on the channel that is meant
-            // to reset the idle task.
             long delayInNanos = idleStateHandler.delay(TimeUnit.NANOSECONDS);
             assertNotEquals(0L, delayInNanos);
 
+            idleStateHandler.tick(delayInNanos / 2L + 1L, TimeUnit.NANOSECONDS);
+            action.run(channel);
+
+            // Advance the ticker by some fraction.
+            // There shouldn't be an IdleStateEvent getting fired because
+            // we've just performed an action on the channel that is meant
+            // to reset the idle task.
             idleStateHandler.tickRun(delayInNanos / 2L, TimeUnit.NANOSECONDS);
             assertEquals(0, events.size());
 

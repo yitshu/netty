@@ -28,6 +28,7 @@ import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.channel.socket.ChannelInputShutdownEvent;
+import io.netty.util.CharsetUtil;
 import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.Test;
 
@@ -490,6 +491,37 @@ public class ByteToMessageDecoderTest {
     }
 
     @Test
+    public void testDoesNotOverReadOnChannelReadComplete() {
+        ReadInterceptingHandler interceptor = new ReadInterceptingHandler();
+        EmbeddedChannel channel = new EmbeddedChannel(interceptor, new ByteToMessageDecoder() {
+            @Override
+            protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+                // NOOP
+            }
+        });
+        channel.config().setAutoRead(false);
+        assertEquals(1, interceptor.readsTriggered);
+        channel.pipeline().fireChannelReadComplete();
+        assertEquals(1, interceptor.readsTriggered);
+        channel.pipeline().fireChannelRead(Unpooled.buffer().writeZero(8));
+        assertEquals(1, interceptor.readsTriggered);
+        // This should trigger a read() as we did not forward any message.
+        channel.pipeline().fireChannelReadComplete();
+        assertEquals(2, interceptor.readsTriggered);
+        // Explicit calling fireChannelReadComplete() again without calling fireChannelRead(...) before should
+        // not trigger another read()
+        channel.pipeline().fireChannelReadComplete();
+        assertEquals(2, interceptor.readsTriggered);
+        channel.pipeline().fireChannelRead(Unpooled.buffer().writeZero(8));
+        assertEquals(2, interceptor.readsTriggered);
+
+        // This should trigger a read() as we did not forward any message.
+        channel.pipeline().fireChannelReadComplete();
+        assertEquals(3, interceptor.readsTriggered);
+        channel.finishAndReleaseAll();
+    }
+
+    @Test
     public void testDisorder() {
         ByteToMessageDecoder decoder = new ByteToMessageDecoder() {
             int count;
@@ -561,5 +593,171 @@ public class ByteToMessageDecoderTest {
         assertEquals(0, interceptor.readsTriggered);
         assertNotNull(channel.pipeline().get(FixedLengthFrameDecoder.class));
         assertFalse(channel.finish());
+    }
+
+    @Test
+    public void testReuseInputBufferJustLargeEnoughToContainMessage_MergeCumulator() {
+        testReusedBuffer(Unpooled.buffer(16), false, ByteToMessageDecoder.MERGE_CUMULATOR);
+    }
+
+    @Test
+    public void testReuseInputBufferJustLargeEnoughToContainMessagePartiallyReceived2x_MergeCumulator() {
+        testReusedBuffer(Unpooled.buffer(16), true, ByteToMessageDecoder.MERGE_CUMULATOR);
+    }
+
+    @Test
+    public void testReuseInputBufferSufficientlyLargeToContainDuplicateMessage_MergeCumulator() {
+        testReusedBuffer(Unpooled.buffer(1024), false, ByteToMessageDecoder.MERGE_CUMULATOR);
+    }
+
+    @Test
+    public void testReuseInputBufferSufficientlyLargeToContainDuplicateMessagePartiallyReceived2x_MergeCumulator() {
+        testReusedBuffer(Unpooled.buffer(1024), true, ByteToMessageDecoder.MERGE_CUMULATOR);
+    }
+
+    @Test
+    public void testReuseInputBufferJustLargeEnoughToContainMessage_CompositeCumulator() {
+        testReusedBuffer(Unpooled.buffer(16), false, ByteToMessageDecoder.COMPOSITE_CUMULATOR);
+    }
+
+    @Test
+    public void testReuseInputBufferJustLargeEnoughToContainMessagePartiallyReceived2x_CompositeCumulator() {
+        testReusedBuffer(Unpooled.buffer(16), true, ByteToMessageDecoder.COMPOSITE_CUMULATOR);
+    }
+
+    @Test
+    public void testReuseInputBufferSufficientlyLargeToContainDuplicateMessage_CompositeCumulator() {
+        testReusedBuffer(Unpooled.buffer(1024), false, ByteToMessageDecoder.COMPOSITE_CUMULATOR);
+    }
+
+    @Test
+    public void testReuseInputBufferSufficientlyLargeToContainDuplicateMessagePartiallyReceived2x_CompositeCumulator() {
+        testReusedBuffer(Unpooled.buffer(1024), true, ByteToMessageDecoder.COMPOSITE_CUMULATOR);
+    }
+
+    static void testReusedBuffer(ByteBuf buffer, boolean secondPartial, ByteToMessageDecoder.Cumulator cumulator) {
+        ByteToMessageDecoder decoder = new ByteToMessageDecoder() {
+            @Override
+            protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+                while (in.readableBytes() >= 4) {
+                    int index = in.readerIndex();
+                    int len = in.readInt();
+                    assert len < (1 << 30) : "In-plausibly long message: " + len;
+                    if (in.readableBytes() >= len) {
+                        byte[] bytes = new byte[len];
+                        in.readBytes(bytes);
+                        String message = new String(bytes, CharsetUtil.UTF_8);
+                        out.add(message);
+                    } else {
+                        in.readerIndex(index);
+                        return;
+                    }
+                }
+            }
+        };
+        decoder.setCumulator(cumulator);
+        EmbeddedChannel channel = new EmbeddedChannel(decoder);
+
+        buffer.retain(); // buffer is allocated from the pool, the pool would call retain()
+        buffer.writeInt(11); // total length of message
+        buffer.writeByte('h').writeByte('e').writeByte('l').writeByte('l');
+        if (secondPartial) {
+            assertFalse(channel.writeInbound(buffer)); // try reading incomplete message
+            assertTrue(channel.inboundMessages().isEmpty());
+            assertEquals(0, buffer.readerIndex(), "Incomplete message should still be readable in buffer");
+            buffer.retain(); // buffer is allocated from the pool - reusing same buffer, the pool would call retain()
+        }
+        buffer.writeByte('o').writeByte(' ');
+        assertFalse(channel.writeInbound(buffer)); // try reading incomplete message
+        assertTrue(channel.inboundMessages().isEmpty());
+        assertEquals(0, buffer.readerIndex(), "Incomplete message should still be readable in buffer");
+
+        buffer.retain(); // buffer is allocated from the pool - reusing same buffer, the pool would call retain()
+        buffer.writeByte('w').writeByte('o').writeByte('r').writeByte('l').writeByte('d');
+        assertTrue(channel.writeInbound(buffer));
+        assertFalse(channel.inboundMessages().isEmpty(), "Message should be received");
+        assertEquals("hello world", channel.inboundMessages().poll(), "Message should be received correctly");
+        assertTrue(channel.inboundMessages().isEmpty(), "Only a single message should be received");
+        assertFalse(buffer.isReadable(), "Buffer should not have remaining data after reading complete message");
+
+        buffer.release(); // we are done with the buffer - release it from the pool
+        assertEquals(0, buffer.refCnt(), "Buffer should be released");
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    void reentrantReadSafety() throws Exception {
+        final EmbeddedChannel channel = new EmbeddedChannel();
+        ByteToMessageDecoder decoder = new ByteToMessageDecoder() {
+            int reentrancy;
+
+            @Override
+            protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+                reentrancy++;
+                if (reentrancy == 1) {
+                    ByteBuf buf2 = channel.alloc().buffer();
+                    buf2.writeLong(42); // Adding 8 bytes.
+                    assertFalse(channel.writeInbound(buf2)); // Reentrant call back into ByteToMessageDecoder
+                    ctx.read();
+                }
+                int bytes = in.readableBytes();
+                out.add(bytes);
+                in.skipBytes(bytes);
+            }
+        };
+        channel.pipeline().addLast(decoder);
+        ByteBuf buf1 = channel.alloc().buffer();
+        buf1.writeInt(42); // Adding 4 bytes.
+        assertTrue(channel.writeInbound(buf1));
+        Integer first = channel.readInbound();
+        Integer second = channel.readInbound();
+        assertEquals(4, first);
+        assertEquals(8, second);
+        assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @Test
+    void reentrantReadThenRemoveSafety() throws Exception {
+        final EmbeddedChannel channel = new EmbeddedChannel();
+        ByteToMessageDecoder decoder = new ByteToMessageDecoder() {
+            boolean removed;
+            int reentrancy;
+
+            @Override
+            protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+                assertFalse(removed);
+                reentrancy++;
+                if (reentrancy == 1) {
+                    ByteBuf buf2 = channel.alloc().buffer();
+                    buf2.writeLong(42); // Adding 8 bytes.
+                    assertFalse(channel.writeInbound(buf2)); // Reentrant call back into ByteToMessageDecoder
+                    ByteBuf buf3 = channel.alloc().buffer();
+                    buf3.writeShort(42); // Adding 2 bytes.
+                    assertFalse(channel.writeInbound(buf3)); // Reentrant call back into ByteToMessageDecoder
+                    ctx.read();
+                } else if (reentrancy == 2) {
+                    ctx.pipeline().remove(this);
+                }
+                int bytes = in.readableBytes();
+                out.add(bytes);
+                in.skipBytes(bytes);
+            }
+
+            @Override
+            protected void handlerRemoved0(ChannelHandlerContext ctx) throws Exception {
+                removed = true;
+            }
+        };
+        channel.pipeline().addLast(decoder);
+        ByteBuf buf1 = channel.alloc().buffer();
+        buf1.writeInt(42); // Adding 4 bytes.
+        assertTrue(channel.writeInbound(buf1));
+        Integer first = channel.readInbound();
+        Integer second = channel.readInbound();
+        Integer third = channel.readInbound();
+        assertEquals(4, first);
+        assertEquals(8, second);
+        assertEquals(2, third);
+        assertFalse(channel.finishAndReleaseAll());
     }
 }
